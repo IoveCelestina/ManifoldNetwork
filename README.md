@@ -1,4 +1,4 @@
-# Manifold · 对话与生图 demo
+# ManifoldNetwork · 对话与生图工作台
 
 一个**相对独立**的聊天 + 图片生成工作台，不改 sub2api 任何东西：
 
@@ -16,7 +16,7 @@
 ## 跑起来
 
 ```powershell
-cd chat-demo
+cd ManifoldNetwork
 node server.js                       # 默认上游 https://zstuacm.xyz，端口 8787
 ```
 
@@ -44,9 +44,10 @@ $env:SUB2API_BASE = "https://zstuacm.xyz"; $env:PORT = "8787"; node server.js
 
 v1 只接 **openai 平台**的 key（一把 key 同时覆盖聊天 + 识图 + 生图）：
 
-1. sub2api 管理后台需要有 **openai 平台的分组**，上游账号指向 CPA（CLIProxyAPI）。
-2. 生图要求 CPA 后面挂的是 **ChatGPT Plus/Pro 的 Codex OAuth 账号**，模型 `gpt-image-2`
-   （CLIProxyAPI ≥ v6.9.30 内置支持；你部署的 v7.1.18 满足）。
+1. sub2api 管理后台需要有 **openai 平台的分组**，分组下挂着可用的
+   **ChatGPT Plus/Pro（Codex OAuth）账号**。
+2. 生图模型是 `gpt-image-2`，要求 sub2api 为较新版本
+   （带 `/v1/images/generations` 和 `/v1/images/edits` 端点；旧版本会 404）。
 3. 用 anthropic 平台分组的 key 时聊天可用（自动转换），但生图会 404 ——
    sub2api 的 `/v1/images/*` 只对 openai 平台分组开放。
 
