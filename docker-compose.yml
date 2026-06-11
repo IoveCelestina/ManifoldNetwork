@@ -1,0 +1,46 @@
+# Manifold chat-demo 独立部署（与 sub2api 完全解耦）
+#
+# 浏览器 → Cloudflare (chat.zstuacm.xyz) → cloudflared 隧道 → chat-demo → 同机 sub2api
+#
+# 用法：
+#   cp .env.example .env   # 填 TUNNEL_TOKEN 和 SUB2API_BASE
+#   docker compose up -d --build
+#
+# 详细步骤见 DEPLOY.md
+
+name: manifold-chat
+
+services:
+  chat-demo:
+    build: .
+    image: manifold/chat-demo:local
+    container_name: manifold-chat-demo
+    restart: unless-stopped
+    environment:
+      # 指向同机 sub2api（host-gateway 解析到宿主机）。
+      # sub2api 如果发布在宿主机别的端口，改 .env 里的 SUB2API_BASE
+      SUB2API_BASE: ${SUB2API_BASE:?SUB2API_BASE is required, see .env.example}
+      PORT: "8787"
+      TZ: ${TZ:-Asia/Shanghai}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # 不发布任何宿主机端口 —— 只有 cloudflared 能通过内部网络访问它
+    networks:
+      - chat-internal
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: manifold-chat-tunnel
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN:?TUNNEL_TOKEN is required, see DEPLOY.md}
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+    networks:
+      - chat-internal
+    depends_on:
+      - chat-demo
+
+networks:
+  chat-internal:
+    name: manifold-chat-internal
+    driver: bridge

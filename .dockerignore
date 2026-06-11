@@ -1,0 +1,6 @@
+.vendor-tmp
+node_modules
+*.log
+.env
+DEPLOY.md
+README.md

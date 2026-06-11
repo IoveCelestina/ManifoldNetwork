@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Manifold · 对话与生图</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232dd4bf' stroke-width='2'/%3E%3Cellipse cx='16' cy='16' rx='13' ry='5' fill='none' stroke='%232dd4bf' stroke-width='1.2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ════════════════ 登录视图 ════════════════ -->
+<div id="view-login" class="view-login hidden">
+  <div class="login-stage">
+    <div class="login-card">
+      <div class="wordmark">
+        <svg class="wordmark-glyph" viewBox="0 0 48 48" aria-hidden="true">
+          <circle cx="24" cy="24" r="19" fill="none"/>
+          <ellipse cx="24" cy="24" rx="19" ry="11" fill="none"/>
+          <ellipse cx="24" cy="24" rx="19" ry="4.5" fill="none"/>
+        </svg>
+        <h1>Manifold</h1>
+        <p class="wordmark-sub">对话 · 生图 工作台</p>
+      </div>
+
+      <!-- 第一步：账号密码 -->
+      <form id="login-form" class="login-step">
+        <label class="field">
+          <span class="field-label">邮箱</span>
+          <input type="email" id="login-email" autocomplete="username" required placeholder="you@example.com">
+        </label>
+        <label class="field">
+          <span class="field-label">密码</span>
+          <input type="password" id="login-password" autocomplete="current-password" required placeholder="••••••••">
+        </label>
+        <button type="submit" class="btn btn-primary btn-block" id="login-submit">登 录</button>
+      </form>
+
+      <!-- 第二步：2FA（按需出现） -->
+      <form id="totp-form" class="login-step hidden">
+        <p class="totp-hint">该账户已开启两步验证，请输入动态验证码</p>
+        <label class="field">
+          <span class="field-label">6 位验证码</span>
+          <input type="text" id="totp-code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" placeholder="000000" autocomplete="one-time-code">
+        </label>
+        <button type="submit" class="btn btn-primary btn-block">验 证</button>
+        <button type="button" class="btn btn-ghost btn-block" id="totp-back">返回重新登录</button>
+      </form>
+
+      <div class="login-divider"><span>或</span></div>
+
+      <!-- 免登录：直接粘 key -->
+      <div id="keyonly-zone">
+        <button type="button" class="btn btn-ghost btn-block" id="keyonly-toggle">不登录，直接粘贴 API Key</button>
+        <form id="keyonly-form" class="hidden">
+          <label class="field">
+            <span class="field-label">API Key</span>
+            <input type="password" id="keyonly-input" placeholder="sk-..." autocomplete="off">
+          </label>
+          <button type="submit" class="btn btn-primary btn-block">进入工作台</button>
+        </form>
+      </div>
+
+      <p id="login-error" class="login-error hidden"></p>
+      <p class="login-upstream">上游：<span id="login-upstream-host" class="mono"></span></p>
+    </div>
+  </div>
+</div>
+
+<!-- ════════════════ 主视图 ════════════════ -->
+<div id="view-app" class="view-app hidden">
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <svg class="brand-glyph" viewBox="0 0 48 48" aria-hidden="true">
+        <circle cx="24" cy="24" r="19" fill="none"/>
+        <ellipse cx="24" cy="24" rx="19" ry="11" fill="none"/>
+        <ellipse cx="24" cy="24" rx="19" ry="4.5" fill="none"/>
+      </svg>
+      <span class="brand-name">Manifold</span>
+    </div>
+
+    <button class="btn btn-newchat" id="btn-new-chat">
+      <span class="newchat-plus">+</span> 新对话
+    </button>
+
+    <nav class="conv-list" id="conv-list" aria-label="对话列表"></nav>
+
+    <div class="sidebar-footer">
+      <div class="me-line" id="me-line">
+        <span class="me-dot"></span>
+        <span class="me-label" id="me-label">未登录</span>
+      </div>
+      <div class="sidebar-actions">
+        <button class="btn btn-ghost btn-small" id="btn-settings">设置</button>
+        <button class="btn btn-ghost btn-small" id="btn-logout">退出</button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="main-header">
+      <div class="header-title" id="header-title">新对话</div>
+      <div class="header-controls">
+        <label class="model-pick">
+          <span class="model-pick-label">模型</span>
+          <select id="model-select"></select>
+        </label>
+        <button class="key-chip mono" id="key-chip" title="点击更换 Key">未设置 Key</button>
+      </div>
+    </header>
+
+    <div class="messages-scroll" id="messages-scroll">
+      <div class="messages" id="messages">
+        <div class="empty-state" id="empty-state">
+          <svg class="empty-glyph" viewBox="0 0 48 48" aria-hidden="true">
+            <circle cx="24" cy="24" r="19" fill="none"/>
+            <ellipse cx="24" cy="24" rx="19" ry="11" fill="none"/>
+            <ellipse cx="24" cy="24" rx="19" ry="4.5" fill="none"/>
+          </svg>
+          <p class="empty-title">开始一段对话</p>
+          <p class="empty-hint">
+            上传图片让模型识图，或在模型选择器里切到
+            <button class="inline-link mono" id="empty-imagegen-link">gpt-image-2</button>
+            描述你想生成的画面
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="composer-zone">
+      <div class="composer" id="composer">
+        <div class="attach-previews hidden" id="attach-previews"></div>
+        <div class="composer-row">
+          <button class="btn-icon" id="btn-attach" title="上传图片（识图）">
+            <svg viewBox="0 0 24 24" width="20" height="20"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z M4 15l4.5-4.5L13 15m2-2 2-2 3 3"/><circle cx="9.5" cy="9.5" r="1.4" fill="currentColor"/></svg>
+          </button>
+          <input type="file" id="file-input" accept="image/*" multiple class="hidden">
+          <textarea id="input-box" rows="1" placeholder="输入消息…"></textarea>
+          <div class="imagegen-controls hidden" id="imagegen-controls">
+            <select id="size-select" title="生成尺寸">
+              <option value="1024x1024">1:1</option>
+              <option value="1536x1024">3:2</option>
+              <option value="1024x1536">2:3</option>
+            </select>
+            <select id="quality-select" title="质量档位：低档更快更省">
+              <option value="auto">质量·auto</option>
+              <option value="low">质量·低</option>
+              <option value="medium">质量·中</option>
+              <option value="high">质量·高</option>
+            </select>
+          </div>
+          <button class="btn btn-send" id="btn-send">发送</button>
+        </div>
+        <div class="composer-hint" id="composer-hint">Enter 发送 · Shift+Enter 换行</div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 设置弹层 -->
+  <div class="modal-mask hidden" id="settings-mask">
+    <div class="modal" role="dialog" aria-label="设置">
+      <h2 class="modal-title">设置</h2>
+
+      <section class="modal-section">
+        <h3 class="modal-section-title">API Key</h3>
+        <div id="key-account-zone" class="hidden">
+          <p class="modal-text">从账户选择（生图需要 <span class="mono">openai</span> 平台分组的 key）：</p>
+          <div class="key-list" id="key-list"></div>
+          <button class="btn btn-ghost btn-small" id="btn-refresh-keys">刷新列表</button>
+        </div>
+        <p class="modal-text">或手动粘贴：</p>
+        <div class="key-paste-row">
+          <input type="password" id="settings-key-input" class="mono" placeholder="sk-...">
+          <button class="btn btn-primary btn-small" id="btn-use-key">使用</button>
+        </div>
+      </section>
+
+      <section class="modal-section">
+        <h3 class="modal-section-title">连接</h3>
+        <p class="modal-text">上游 sub2api：<span class="mono" id="settings-upstream"></span></p>
+      </section>
+
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="btn-close-settings">关闭</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script src="/config.js"></script>
+<script src="/vendor/marked.min.js"></script>
+<script src="/vendor/purify.min.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

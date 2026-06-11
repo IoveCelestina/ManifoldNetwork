@@ -1,0 +1,10 @@
+{
+  "name": "manifold-network",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Manifold 对话 + 生图 demo：静态前端 + 同源代理到 sub2api",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
