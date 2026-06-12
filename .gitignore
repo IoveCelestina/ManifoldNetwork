@@ -6,8 +6,10 @@ node_modules/
 .vendor-tmp/
 *.log
 
-# 会话数据库（有状态，绝不入库；生产放 Docker 卷）
+# 会话数据库 + 图片 blob（有状态，绝不入库；生产放 Docker 卷）
 manifold.db
 *.db
 *.db-wal
 *.db-shm
+blobs/
+_blobs/

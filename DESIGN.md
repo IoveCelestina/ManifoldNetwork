@@ -1,7 +1,7 @@
 # ManifoldNetwork 架构蓝图 · 从「套壳」到「真前后端」
 
-> 本文是**施工蓝图**，不是已实现的现状。落地按文末「分阶段」推进，每阶段可独立停下。
-> 现状（main 分支）仍是：浏览器持 key 直打 `/v1`、服务端是哑代理 + 单 JSON-blob 会话库。
+> 本文是**施工蓝图**。**Phase 0 已落地并上线**（main，2026-06）：推理与凭证搬到服务端、浏览器只持 httpOnly cookie、后端 TS 化、旧 `/v1` 直打已下线（`LEGACY_PROXY=off`）。
+> 现状仍是**单 JSON-blob 会话库**（base64 图内联、每轮重写整段）——这正是 **Phase 1** 要拆的（见 §7、§10）。后续按文末「分阶段」推进，每阶段可独立停下。
 
 ## 0. 范围与已定决策
 
@@ -213,7 +213,7 @@ for 每个旧 conversations 行:
 
 ## 10. 分阶段
 
-- **Phase 0 ｜ 真后端 + 服务端推理**（壳 → 产品的那一跃）
+- **Phase 0 ｜ 真后端 + 服务端推理**（壳 → 产品的那一跃）✅ **已上线**（main，PR #1）
   - 加 `sessions` + httpOnly cookie 鉴权；登录/2FA/刷新/登出移服务端。
   - `/api/conversations/:id/messages`、`/images`、`/models` 服务端调上游 + SSE。
   - 前端重指向这些 API，删除客户端持 key / 拼 prompt。

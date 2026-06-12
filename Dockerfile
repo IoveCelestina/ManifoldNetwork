@@ -4,7 +4,7 @@
 FROM node:24-alpine
 
 WORKDIR /app
-COPY server.ts db.ts package.json ./
+COPY server.ts db.ts migrate-phase1.ts package.json ./
 COPY public ./public
 
 ENV PORT=8787

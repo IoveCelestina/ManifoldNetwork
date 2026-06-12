@@ -256,6 +256,144 @@ function updateSessionKey(
   stmtSessKey.run(apiKey, keyLabel, keyPlatform, token);
 }
 
+// ── Phase 1：拆分的数据模型（messages / blobs / message_blobs）─────────
+// 一条消息一行（只 INSERT，不再重写整段会话）；图片内容寻址（blobs.hash = sha256），二进制落 BLOB_DIR。
+// conversations 表复用：Phase 1 新会话 data 列写空串；老 data 迁移后保留以便回退。
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS messages (
+    id         TEXT PRIMARY KEY,
+    conv_id    TEXT    NOT NULL,
+    uid        INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    role       TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,
+    model      TEXT,
+    text       TEXT    NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+  );
+`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_msg_conv_seq ON messages(conv_id, seq)');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS blobs (
+    hash       TEXT PRIMARY KEY,
+    mime       TEXT    NOT NULL,
+    size       INTEGER NOT NULL,
+    created_at INTEGER NOT NULL
+  );
+`);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS message_blobs (
+    message_id TEXT    NOT NULL,
+    blob_hash  TEXT    NOT NULL,
+    ord        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (message_id, blob_hash)
+  );
+`);
+db.exec('CREATE INDEX IF NOT EXISTS idx_mb_hash ON message_blobs(blob_hash)');
+
+interface ConvMetaRow { id: string; title: string; createdAt: number; updatedAt: number; }
+interface MessageOut {
+  id: string; role: string; kind: string; model: string | null;
+  text: string; seq: number; createdAt: number; blobs: string[];
+}
+interface InsertMessageInput {
+  id: string; convId: string; uid: number; seq: number;
+  role: string; kind: string; model?: string | null; text?: string;
+}
+
+// 会话（conversations 表，Phase 1 不写 data 列）
+const stmtConvList2: Stmt = db.prepare('SELECT id, title, created_at, updated_at FROM conversations WHERE uid = ? ORDER BY updated_at DESC');
+const stmtConvGet2: Stmt = db.prepare('SELECT id, title, created_at, updated_at FROM conversations WHERE uid = ? AND id = ?');
+const stmtConvIns2: Stmt = db.prepare("INSERT INTO conversations (uid, id, title, created_at, updated_at, data) VALUES (?, ?, ?, ?, ?, '')");
+const stmtConvRename: Stmt = db.prepare('UPDATE conversations SET title = ?, updated_at = ? WHERE uid = ? AND id = ?');
+const stmtConvTouch: Stmt = db.prepare('UPDATE conversations SET updated_at = ? WHERE uid = ? AND id = ?');
+const stmtConvDel2: Stmt = db.prepare('DELETE FROM conversations WHERE uid = ? AND id = ?');
+// 消息
+const stmtMsgIns: Stmt = db.prepare('INSERT INTO messages (id, conv_id, uid, seq, role, kind, model, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
+// 一律带 uid 过滤：即使 conv_id 跨 uid 碰撞，也不会读/删到他人消息（纵深防御）。
+const stmtMsgList: Stmt = db.prepare('SELECT * FROM messages WHERE conv_id = ? AND uid = ? ORDER BY seq');
+const stmtMsgNextSeq: Stmt = db.prepare('SELECT COALESCE(MAX(seq), -1) + 1 AS n FROM messages WHERE conv_id = ? AND uid = ?');
+const stmtMsgDelByConv: Stmt = db.prepare('DELETE FROM messages WHERE conv_id = ? AND uid = ?');
+const stmtMsgHasConv: Stmt = db.prepare('SELECT 1 FROM messages WHERE conv_id = ? AND uid = ? LIMIT 1');
+// blob
+const stmtBlobIns: Stmt = db.prepare('INSERT OR IGNORE INTO blobs (hash, mime, size, created_at) VALUES (?, ?, ?, ?)');
+const stmtBlobGet: Stmt = db.prepare('SELECT hash, mime, size FROM blobs WHERE hash = ?');
+const stmtMbIns: Stmt = db.prepare('INSERT OR IGNORE INTO message_blobs (message_id, blob_hash, ord) VALUES (?, ?, ?)');
+const stmtMbByMsg: Stmt = db.prepare('SELECT blob_hash FROM message_blobs WHERE message_id = ? ORDER BY ord');
+const stmtMbDelByConv: Stmt = db.prepare('DELETE FROM message_blobs WHERE message_id IN (SELECT id FROM messages WHERE conv_id = ? AND uid = ?)');
+const stmtBlobOwn: Stmt = db.prepare('SELECT 1 FROM messages m JOIN message_blobs mb ON m.id = mb.message_id WHERE m.uid = ? AND mb.blob_hash = ? LIMIT 1');
+const stmtBlobOrphans: Stmt = db.prepare('SELECT hash FROM blobs WHERE hash NOT IN (SELECT DISTINCT blob_hash FROM message_blobs)');
+
+function listConvs(uid: number): ConvMetaRow[] {
+  return stmtConvList2.all(uid).map((r: any) => ({ id: r.id, title: r.title, createdAt: r.created_at, updatedAt: r.updated_at }));
+}
+function getConvMeta(uid: number, id: string): ConvMetaRow | null {
+  const r = stmtConvGet2.get(uid, id);
+  return r ? { id: r.id, title: r.title, createdAt: r.created_at, updatedAt: r.updated_at } : null;
+}
+function createConv(uid: number, id: string, title: string): void {
+  const now = Date.now();
+  stmtConvIns2.run(uid, id, title || '新对话', now, now);
+}
+function renameConv(uid: number, id: string, title: string): void {
+  stmtConvRename.run(title, Date.now(), uid, id);
+}
+function touchConv(uid: number, id: string): void {
+  stmtConvTouch.run(Date.now(), uid, id);
+}
+// 删会话：连带 messages + message_blobs，单事务。blob 文件留给 GC（orphanBlobs）。
+function deleteConv(uid: number, id: string): void {
+  if (!stmtConvGet2.get(uid, id)) return;
+  db.exec('BEGIN');
+  try {
+    stmtMbDelByConv.run(id, uid);
+    stmtMsgDelByConv.run(id, uid);
+    stmtConvDel2.run(uid, id);
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); throw e; }
+}
+// 该会话是否已有 messages（迁移幂等判断用）
+function convHasMessages(convId: string, uid: number): boolean {
+  return !!stmtMsgHasConv.get(convId, uid);
+}
+
+function nextSeq(convId: string, uid: number): number {
+  return (stmtMsgNextSeq.get(convId, uid) as any).n;
+}
+function insertMessage(m: InsertMessageInput): void {
+  stmtMsgIns.run(m.id, m.convId, m.uid, m.seq, m.role, m.kind, m.model ?? null, m.text ?? '', Date.now());
+}
+function getMessages(convId: string, uid: number): MessageOut[] {
+  return stmtMsgList.all(convId, uid).map((r: any) => ({
+    id: r.id, role: r.role, kind: r.kind, model: r.model, text: r.text, seq: r.seq, createdAt: r.created_at,
+    blobs: stmtMbByMsg.all(r.id).map((b: any) => b.blob_hash),
+  }));
+}
+
+function insertBlob(hash: string, mime: string, size: number): void {
+  stmtBlobIns.run(hash, mime, size, Date.now());
+}
+function getBlobMeta(hash: string): { hash: string; mime: string; size: number } | null {
+  const r = stmtBlobGet.get(hash);
+  return r ? { hash: r.hash, mime: r.mime, size: r.size } : null;
+}
+function linkBlob(messageId: string, hash: string, ord: number): void {
+  stmtMbIns.run(messageId, hash, ord);
+}
+// blob 鉴权：当前 uid 是否拥有引用该 hash 的消息
+function userOwnsBlob(uid: number, hash: string): boolean {
+  return !!stmtBlobOwn.get(uid, hash);
+}
+// 无任何 message_blobs 引用的孤儿 blob（GC 用）
+function orphanBlobs(): string[] {
+  return stmtBlobOrphans.all().map((r: any) => r.hash);
+}
+
+// 迁移用：列出所有会话（含 data 列），供 migrate-phase1.ts 把老 JSON-blob 拆进新表。
+const stmtConvAll: Stmt = db.prepare('SELECT uid, id, data FROM conversations');
+function listConvsForMigration(): any[] { return stmtConvAll.all(); }
+
 // 优雅关闭时把 WAL 合并回主库（TRUNCATE 顺带清空 WAL 文件）。失败不致命——WAL 本身已 fsync，不丢数据。
 function checkpoint(): void {
   try { db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); } catch { /* ignore */ }
@@ -265,4 +403,8 @@ module.exports = {
   listMeta, getOne, upsert, del, DB_PATH,
   createSession, readSession, deleteSession, updateSessionTokens, updateSessionKey,
   SESSION_TTL_MS, checkpoint,
+  // Phase 1：会话/消息/blob 数据访问层
+  listConvs, getConvMeta, createConv, renameConv, touchConv, deleteConv, convHasMessages,
+  nextSeq, insertMessage, getMessages,
+  insertBlob, getBlobMeta, linkBlob, userOwnsBlob, orphanBlobs, listConvsForMigration,
 };
