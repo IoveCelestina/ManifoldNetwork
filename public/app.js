@@ -80,6 +80,137 @@ async function idbDel(id) {
     tx.onabort = () => reject(tx.error || new Error('IndexedDB 删除事务被中止'));
   });
 }
+async function idbClear() {
+  const d = await db();
+  return new Promise((resolve, reject) => {
+    const tx = d.transaction('conv', 'readwrite');
+    tx.objectStore('conv').clear();
+    tx.oncomplete = resolve;
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('IndexedDB 清空事务被中止'));
+  });
+}
+
+/* ───────────────────── 会话存储抽象（登录→后端同步 / 否则→本地 IndexedDB） ───────────────────── */
+
+// 账号密码登录 → 走后端 /store/*；keyonly 或未登录 → 走本地 IndexedDB（离线/免登录不受影响）。
+function useServer() { return !!state.auth?.access_token; }
+
+// 只把要持久化的字段发后端，剔除 _loading 等运行时标记
+function serializeConv(conv) {
+  return {
+    id: conv.id,
+    title: conv.title,
+    createdAt: conv.createdAt,
+    updatedAt: conv.updatedAt,
+    messages: Array.isArray(conv.messages) ? conv.messages : [],
+  };
+}
+
+// 调本服务的 /store/*：带 sub2api token；401 时复用 tryRefresh 刷新后重试一次
+async function storeFetch(path, opts = {}, retried = false) {
+  const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+  if (state.auth?.access_token) headers['Authorization'] = `Bearer ${state.auth.access_token}`;
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  if (res.status === 401 && state.auth?.refresh_token && !retried) {
+    if (!refreshPromise) refreshPromise = tryRefresh().finally(() => { refreshPromise = null; });
+    if (await refreshPromise) return storeFetch(path, opts, true);
+  }
+  if (!res.ok) {
+    let msg = `HTTP ${res.status}`;
+    try { const j = await res.json(); msg = j?.error?.message || j?.message || msg; } catch { /* 非 JSON */ }
+    throw new Error(msg);
+  }
+  try { return await res.json(); } catch { return null; }
+}
+
+const store = {
+  async list() {
+    if (useServer()) {
+      const data = await storeFetch('/store/conversations');
+      // 列表仅元数据；messages 置 null 标记「未加载」，打开会话时再拉
+      return (data?.conversations || []).map((c) => ({ ...c, messages: null }));
+    }
+    return await idbAll();
+  },
+  async get(id) {
+    if (useServer()) return await storeFetch(`/store/conversations/${encodeURIComponent(id)}`);
+    return state.convs.find((c) => c.id === id) || null;
+  },
+  async put(conv) {
+    if (useServer()) {
+      await storeFetch(`/store/conversations/${encodeURIComponent(conv.id)}`, {
+        method: 'PUT', body: JSON.stringify(serializeConv(conv)),
+      });
+      return;
+    }
+    await idbPut(conv);
+  },
+  async del(id) {
+    if (useServer()) { await storeFetch(`/store/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }); return; }
+    await idbDel(id);
+  },
+};
+
+// 按需加载：把某会话 messages 从后端补全（本地模式或已加载则直接返回）
+async function ensureMessages(conv) {
+  if (!conv || Array.isArray(conv.messages)) return;
+  if (!useServer()) { conv.messages = []; return; }
+  try {
+    const full = await store.get(conv.id);
+    conv.messages = (full && full.messages) || [];
+  } catch (e) {
+    conv.messages = [];
+    console.warn('加载会话正文失败', e);
+  }
+}
+
+// 切到某会话并确保正文已加载（流式中不切，避免写串）
+async function openConv(id) {
+  if (state.streaming) return;
+  state.currentId = id;
+  renderConvList();
+  renderMessages();                       // 立即反馈（messages 为 null 时显示「载入中」）
+  const conv = currentConv();
+  if (conv && !Array.isArray(conv.messages)) {
+    await ensureMessages(conv);
+    if (state.currentId === id) renderMessages();
+  }
+}
+
+// 统一加载会话列表（按 useServer 选后端/本地），并设好 currentId
+async function loadConversations() {
+  try {
+    const all = await store.list();
+    state.convs = all.sort((a, b) => b.updatedAt - a.updatedAt);
+  } catch (e) {
+    console.warn('加载会话列表失败', e);
+    state.convs = [];
+  }
+  state.currentId = state.convs[0]?.id || null;
+}
+
+// 老数据迁移：首次进入 server 模式时，若本机 IndexedDB 还存着对话，问一次是否导入到账号
+let migrating = false;
+async function maybeMigrateLocal() {
+  if (migrating || !useServer()) return;
+  if (localStorage.getItem('mfchat_migrated')) return;
+  let local = [];
+  try { local = await idbAll(); } catch { return; }
+  localStorage.setItem('mfchat_migrated', '1');   // 标记一次，避免反复打扰（即便用户拒绝）
+  if (!local.length) return;
+  if (!confirm(`检测到本机有 ${local.length} 个本地对话，导入到当前账号并云端同步？\n（导入后会从本机移除本地副本）`)) return;
+  migrating = true;
+  let done = 0;
+  for (const conv of local) {
+    try { await store.put(conv); done++; } catch (e) { console.warn('迁移失败', conv.id, e); }
+  }
+  try { await idbClear(); } catch { /* 清本地失败不致命 */ }
+  await loadConversations();
+  migrating = false;
+  if (state.currentId) openConv(state.currentId); else { renderConvList(); renderMessages(); }
+  alert(`已导入 ${done}/${local.length} 个对话。`);
+}
 
 /* ───────────────────────── sub2api 用户接口（JWT + envelope） ───────────────────────── */
 
@@ -106,6 +237,10 @@ async function apiFetch(path, opts = {}, retried = false) {
     const ok = await refreshPromise;
     if (ok) return apiFetch(path, opts, true);
     setAuth(null);
+    setApiKey(null);                 // 换账号重登前清掉上一个账号的 key，避免跨账号误用其额度
+    state.convs = [];
+    state.currentId = null;
+    idbClear().catch(() => {});
     showLogin('登录已过期，请重新登录');
     throw new Error('登录已过期');
   }
@@ -173,8 +308,12 @@ function showApp() {
   renderKeyChip();
   loadModels();
   if (!state.currentId) state.currentId = state.convs[0]?.id || null;
-  renderConvList();
-  renderMessages();
+  if (state.currentId) {
+    openConv(state.currentId);            // 渲染 + 按需加载正文
+  } else {
+    renderConvList();
+    renderMessages();
+  }
   if (state.auth) loadAccountKeys().catch(() => {});
 }
 function loginError(msg) {
@@ -238,6 +377,7 @@ async function finishLogin(data) {
     refresh_token: data.refresh_token || null,
     user: data.user || null,
   });
+  await loadConversations();               // 切到该账号的服务端对话
   // 登录成功 → 自动拉账户下的 key；有且只有一个时直接用
   try {
     const keys = await loadAccountKeys();
@@ -245,6 +385,7 @@ async function finishLogin(data) {
     if (!state.apiKey && usable.length === 1) setApiKey(usable[0].key, usable[0].name);
   } catch { /* key 拉取失败不阻塞进入 */ }
   showApp();
+  maybeMigrateLocal();
   if (!state.apiKey) openSettings();
 }
 
@@ -252,11 +393,12 @@ $('keyonly-toggle').addEventListener('click', () => {
   $('keyonly-form').classList.toggle('hidden');
   $('keyonly-input').focus();
 });
-$('keyonly-form').addEventListener('submit', (e) => {
+$('keyonly-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const k = $('keyonly-input').value.trim();
   if (!k) return;
   setApiKey(k);
+  await loadConversations();
   showApp();
 });
 
@@ -275,6 +417,9 @@ $('btn-logout').addEventListener('click', () => {
   setAuth(null);
   setApiKey(null);
   state.keysCache = null;
+  state.convs = [];
+  state.currentId = null;
+  idbClear().catch(() => {});      // 清本地缓存的会话，避免共享设备泄露（账号数据在服务端，不受影响）
   showLogin();
 });
 
@@ -468,7 +613,7 @@ async function persistConv(conv) {
   conv.updatedAt = Date.now();
   let ok = true;
   try {
-    await idbPut(conv);
+    await store.put(conv);
   } catch (e) {
     ok = false;
     console.warn('persist failed', e);
@@ -478,9 +623,10 @@ async function persistConv(conv) {
         alert('浏览器存储空间已满，本次对话无法持久保存。\n建议删掉旧对话（特别是含生成图片的），或把重要图片先下载下来。');
       }
     } else if (!persistWarned) {
-      // 其它写入失败（事务被中止、隐私模式禁用 IndexedDB 等）：本次仍能用，但刷新会丢，得让用户知道
+      // 其它写入失败（后端不可达、事务被中止、隐私模式禁 IndexedDB 等）：本次仍能用，但得让用户知道
       persistWarned = true;
-      alert(`对话保存失败：${e?.message || e}\n当前对话在本次浏览中仍可继续，但刷新页面后可能丢失。`);
+      const where = useServer() ? '未能同步到服务器' : '刷新页面后可能丢失';
+      alert(`对话保存失败：${e?.message || e}\n当前对话本次仍可继续，但${where}。`);
     }
   }
   renderConvList();
@@ -502,8 +648,9 @@ function renderConvList() {
     del.textContent = '×';
     del.addEventListener('click', async (e) => {
       e.stopPropagation();
+      if (state.streaming) return;    // 流式中不删，避免流结束时 persist 把已删会话写回（复活）
       state.convs = state.convs.filter((c) => c.id !== conv.id);
-      await idbDel(conv.id).catch(() => {});
+      await store.del(conv.id).catch(() => {});
       if (state.currentId === conv.id) {
         state.currentId = state.convs[0]?.id || null;
         renderMessages();
@@ -513,10 +660,7 @@ function renderConvList() {
     item.appendChild(title);
     item.appendChild(del);
     item.addEventListener('click', () => {
-      if (state.streaming) return; // 流式中不切会话，避免写串
-      state.currentId = conv.id;
-      renderConvList();
-      renderMessages();
+      openConv(conv.id);           // 切换 + 按需加载（内部已挡流式）
     });
     nav.appendChild(item);
   }
@@ -540,12 +684,23 @@ function renderMessages() {
   wrap.innerHTML = '';
   const conv = currentConv();
   $('header-title').textContent = conv?.title || '新对话';
+  if (conv && !Array.isArray(conv.messages)) {   // 后端正文按需加载中
+    wrap.appendChild(buildLoadingState());
+    return;
+  }
   if (!conv || !conv.messages.length) {
     wrap.appendChild(buildEmptyState());
     return;
   }
   for (const m of conv.messages) wrap.appendChild(buildMsgEl(m));
   scrollToBottom(true);
+}
+
+function buildLoadingState() {
+  const div = document.createElement('div');
+  div.className = 'empty-state';
+  div.innerHTML = '<p class="empty-title">载入对话中…</p>';
+  return div;
 }
 
 function buildEmptyState() {
@@ -813,6 +968,7 @@ function buildApiMessages(conv) {
 
 async function sendChat(text) {
   const conv = currentConv() || newConv();
+  await ensureMessages(conv);              // 后端会话可能正文未加载，先补全再 push
   const model = currentModel();
   pushUserMessage(conv, text);
   await persistConv(conv);
@@ -996,6 +1152,7 @@ async function readImageSse(res, pendingEl) {
 async function sendImageGen(prompt) {
   if (!prompt) return;
   const conv = currentConv() || newConv();
+  await ensureMessages(conv);              // 同上：先确保正文已加载
   const model = currentModel();
   let size = $('size-select').value;
   const quality = $('quality-select').value;
@@ -1164,15 +1321,11 @@ function formatApiError(status, bodyText) {
     el.textContent = UPSTREAM;
   });
 
-  try {
-    const all = await idbAll();
-    state.convs = all.sort((a, b) => b.updatedAt - a.updatedAt);
-  } catch (e) {
-    console.warn('IndexedDB 不可用，会话不持久化', e);
-  }
+  await loadConversations();
 
   if (state.auth || state.apiKey) {
     showApp();
+    maybeMigrateLocal();
   } else {
     showLogin();
   }

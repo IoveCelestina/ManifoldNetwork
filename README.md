@@ -5,6 +5,7 @@
 ```
 浏览器 ──同源──> 本服务(server.js)
                    ├─ /            静态前端（登录 / 聊天 / 生图）
+                   ├─ /store/*     会话存储（SQLite，按 sub2api 账号隔离）
                    ├─ /api/v1/*  ──转发──> sub2api 用户接口（登录、key 列表）
                    └─ /v1/*      ──转发──> sub2api 网关（聊天、识图、生图）
 ```
@@ -38,7 +39,7 @@ $env:SUB2API_BASE = "https://zstuacm.xyz"; $env:PORT = "8787"; node server.js
 | 识图 | 上传图片（自动压到最长边 1568px），以 `image_url` base64 随消息发送 |
 | 生图 | 模型切到 `gpt-image-2`（输入区变琥珀色）→ 描述画面 → `POST /v1/images/generations` |
 | 垫图改图 | 生图模式下附参考图 + 描述 → 自动改走 `POST /v1/images/edits`（multipart） |
-| 会话 | 存浏览器 IndexedDB，多会话切换/删除 |
+| 会话 | 登录账号 → 对话存服务端 SQLite、**跨设备按账号同步**；仅贴 key（不登录）→ 存浏览器 IndexedDB |
 
 ## 前提（重要）
 

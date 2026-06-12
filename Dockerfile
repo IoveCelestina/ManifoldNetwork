@@ -2,7 +2,7 @@
 FROM node:24-alpine
 
 WORKDIR /app
-COPY server.js package.json ./
+COPY server.js db.js package.json ./
 COPY public ./public
 
 ENV PORT=8787

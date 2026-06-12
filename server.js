@@ -16,6 +16,13 @@ const BASE = (process.env.SUB2API_BASE || 'https://zstuacm.xyz').replace(/\/+$/,
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
+// ── 会话存储（/store/*，按 sub2api user_id 隔离）──────────────────
+const db = require('./db');                  // node:sqlite 单文件
+const STORE_MAX_BODY = 25 * 1024 * 1024;     // /store 写入体积上限，防 DB 撑肿
+const USER_CACHE_TTL = 60 * 1000;            // token→user_id 解析缓存 TTL
+const CONV_ID_RE = /^[A-Za-z0-9_-]{1,128}$/; // 合法会话 id（与前端 c_xxx 命名一致）
+const userCache = new Map();                 // token -> { uid, exp }
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -51,14 +58,14 @@ const SKIP_RES_HEADERS = new Set([
 
 const MAX_BODY = 50 * 1024 * 1024; // 识图 base64 也用不了 50MB；防恶意大包打爆内存
 
-function collectBody(req) {
+function collectBody(req, limit = MAX_BODY) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
     req.on('data', (c) => {
       total += c.length;
-      if (total > MAX_BODY) {
-        reject(Object.assign(new Error('请求体超过 50MB 上限'), { statusCode: 413 }));
+      if (total > limit) {
+        reject(Object.assign(new Error(`请求体超过 ${Math.round(limit / 1024 / 1024)}MB 上限`), { statusCode: 413 }));
         req.destroy();
         return;
       }
@@ -170,8 +177,104 @@ async function proxy(req, res) {
   }
 }
 
+function parseBearer(req) {
+  const h = req.headers['authorization'] || '';
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  return m ? m[1].trim() : null;
+}
+
+function sendJson(res, status, obj) {
+  if (res.headersSent) { res.end(); return; }
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+
+// token → sub2api user_id。带 60s 缓存，避免每个 /store 请求都回调 /api/v1/auth/me。
+// 客户端无法伪造身份：uid 来自上游对 token 的验证，不信任客户端自报。
+async function resolveUser(token) {
+  if (!token) return null;
+  const now = Date.now();
+  const hit = userCache.get(token);
+  if (hit && hit.exp > now) return hit.uid;
+
+  let uid = null;
+  try {
+    const r = await fetch(BASE + '/api/v1/auth/me', {
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/json' },
+    });
+    if (r.ok) {
+      const j = await r.json();
+      const data = (j && typeof j === 'object' && 'data' in j) ? j.data : j; // 兼容 {code,message,data} 信封
+      const raw = data?.id ?? data?.user_id ?? data?.user?.id;
+      if (raw !== undefined && raw !== null && Number.isFinite(Number(raw))) uid = Number(raw);
+    }
+  } catch { /* 上游不可达 → 视为未认证 */ }
+
+  if (uid !== null) {
+    userCache.set(token, { uid, exp: now + USER_CACHE_TTL });
+    if (userCache.size > 1000) {                  // 简单防膨胀：清掉过期项
+      for (const [k, v] of userCache) if (v.exp <= now) userCache.delete(k);
+    }
+  }
+  return uid;
+}
+
+// /store/conversations          GET   列表（仅元数据）
+// /store/conversations/<id>     GET   单条（含 messages） / PUT 写入 / DELETE 删除
+async function handleStore(req, res) {
+  const uid = await resolveUser(parseBearer(req));
+  if (uid === null) { sendJson(res, 401, { error: { message: '未登录或登录已过期' } }); return; }
+
+  const segs = req.url.split('?')[0].split('/').filter(Boolean); // ['store','conversations', id?]
+  if (segs[1] !== 'conversations') { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  const convId = segs[2] || null;
+  if (convId && !CONV_ID_RE.test(convId)) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
+
+  // 集合
+  if (!convId) {
+    if (req.method === 'GET') { sendJson(res, 200, { conversations: db.listMeta(uid) }); return; }
+    sendJson(res, 405, { error: { message: 'method not allowed' } });
+    return;
+  }
+
+  // 单条
+  if (req.method === 'GET') {
+    const conv = db.getOne(uid, convId);
+    if (!conv) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+    sendJson(res, 200, conv);
+    return;
+  }
+  if (req.method === 'DELETE') {
+    db.del(uid, convId);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  if (req.method === 'PUT') {
+    let body;
+    try { body = await collectBody(req, STORE_MAX_BODY); }
+    catch (err) { sendJson(res, err.statusCode || 400, { error: { message: err.message } }); return; }
+    let conv;
+    try { conv = JSON.parse(body.toString('utf8')); }
+    catch { sendJson(res, 400, { error: { message: 'body 不是合法 JSON' } }); return; }
+    if (!conv || conv.id !== convId) { sendJson(res, 400, { error: { message: 'body.id 与路径不一致' } }); return; }
+    db.upsert(uid, conv);
+    sendJson(res, 200, { ok: true });
+    return;
+  }
+  sendJson(res, 405, { error: { message: 'method not allowed' } });
+}
+
 function serveStatic(req, res) {
-  let urlPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+  // 畸形百分号编码（如 /%、/%ZZ）会让 decodeURIComponent 抛 URIError；必须就地拦成 400。
+  // 否则该同步异常会冒泡出 createServer 回调、无人接管 → 进程崩溃（一行 curl 即可远程 DoS）。
+  let urlPath;
+  try {
+    urlPath = decodeURIComponent(new URL(req.url, 'http://localhost').pathname);
+  } catch {
+    res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Bad Request');
+    return;
+  }
   if (urlPath === '/') urlPath = '/index.html';
 
   if (urlPath === '/config.js') {
@@ -203,20 +306,44 @@ function serveStatic(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  if (req.url.startsWith('/api/') || req.url.startsWith('/v1/')) {
-    proxy(req, res).catch((err) => {
-      console.error('[proxy] unhandled:', err);
-      if (!res.headersSent) res.writeHead(500);
-      res.end();
-    });
-  } else {
-    serveStatic(req, res);
+  // 兜底：任何同步异常都不该掀翻进程。proxy() 是异步、自带 .catch；serveStatic() 是同步，
+  // 这里再包一层，把请求级错误关进 500，而不是让它变成 uncaughtException。
+  try {
+    if (req.url.startsWith('/store/')) {
+      handleStore(req, res).catch((err) => {
+        console.error('[store] unhandled:', err);
+        if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end();
+      });
+    } else if (req.url.startsWith('/api/') || req.url.startsWith('/v1/')) {
+      proxy(req, res).catch((err) => {
+        console.error('[proxy] unhandled:', err);
+        if (!res.headersSent) res.writeHead(500);
+        res.end();
+      });
+    } else {
+      serveStatic(req, res);
+    }
+  } catch (err) {
+    console.error('[request] unhandled:', err);
+    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end();
   }
 });
 
 // 生图 / 长流式响应都可能远超默认超时
 server.requestTimeout = 0;
 server.headersTimeout = 60 * 1000;
+
+// 最后一道兜底：未预料到的异常 / Promise 拒绝只记录，不让进程无声退出。
+// 已知崩溃向量（畸形 URL）已在请求层就地拦成 400/500，这里只为留住诊断线索，
+// 避免线上「崩溃 → 自动重启 → 掐断所有在途流式请求」的最坏情况。
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] uncaughtException:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] unhandledRejection:', reason);
+});
 
 server.listen(PORT, () => {
   console.log(`Manifold chat-demo 已启动: http://localhost:${PORT}`);

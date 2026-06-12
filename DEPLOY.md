@@ -14,7 +14,7 @@
 
 **为什么选 Cloudflare Tunnel 方案：**
 
-- **跟 sub2api 零耦合**：不动它的容器、配置、Caddy/端口，独立 compose 独立网络，随时整套删掉不留痕
+- **跟 sub2api 零耦合**：不动它的容器、配置、Caddy/端口，独立 compose 独立网络（对话数据在自己的命名卷里，要连数据一起删用 `docker compose down -v`）
 - **不占 80/443**：cloudflared 是出站连接，服务器不用为它开任何入站端口，ufw 都不用动
 - **不用管证书**：HTTPS 由 Cloudflare 边缘终结，源站不需要签证书
 - **天然隐藏 IP + 国内可访问**：和主域名同一套 Cloudflare 体系（你的源站 IP 本来就被 GFW 封了 443，隧道方案正好完全不暴露源站）
@@ -102,7 +102,23 @@ curl -s -o /dev/null -w '%{http_code}\n' https://chat.zstuacm.xyz/
 | 更新代码 | 本机改完 → 重新 `scp -r` 覆盖 → 服务器 `docker compose up -d --build` |
 | 重启 | `docker compose restart` |
 | 整套下线 | `docker compose down`（卸载隧道再去 CF 面板删 tunnel + DNS 记录） |
-| 备份 | **无需备份** —— 服务端零状态，所有会话/登录态都在用户浏览器里 |
+| 备份 | 备份 `manifold-chat-data` 卷里的 `manifold.db`（见下方「数据与备份」）；登录态仍在用户浏览器 |
+
+## 数据与备份
+
+升级到「按账号同步对话」后，**服务端不再是零状态**：对话存在 chat-demo 容器内的 SQLite
+（`DB_PATH=/data/manifold.db`，落在命名卷 `manifold-chat-data`）。身份与计费仍走 sub2api，
+后端不存密码、不存 key，只按 sub2api 的 `user_id` 隔离存对话。
+
+```bash
+# 一致快照（WAL 模式下安全，无需停服）
+docker compose exec chat-demo node -e "const{DatabaseSync}=require('node:sqlite');new DatabaseSync('/data/manifold.db').exec(\"VACUUM INTO '/data/backup-tmp.db'\")"
+docker compose cp chat-demo:/data/backup-tmp.db ./manifold-$(date +%F).db
+docker compose exec chat-demo rm -f /data/backup-tmp.db
+```
+
+- `docker compose down` **不删卷**，数据还在；`docker compose down -v` 会**连对话一起删**（不可逆）。
+- 公网开放给陌生人前，仍需补**每 IP 限流 / 登录防爆破 / CSP** 等公开级防护（当前定位为自用/熟人）。
 
 ## 注意事项
 
