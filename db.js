@@ -11,6 +11,12 @@ const { DatabaseSync } = require('node:sqlite');
 
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'manifold.db');
 
+// 每用户配额（防单账号 / 泄露凭证撑爆磁盘）。身份是 sub2api 鉴过的 user_id，故按 uid 限。
+//   STORE_MAX_CONVERSATIONS  单账号最多保存的对话条数
+//   STORE_MAX_BYTES_PER_USER 单账号所有对话 data 列的总字节上限（含 base64 图）
+const MAX_CONV_PER_USER = Number(process.env.STORE_MAX_CONVERSATIONS || 500);
+const MAX_BYTES_PER_USER = Number(process.env.STORE_MAX_BYTES_PER_USER || 200 * 1024 * 1024);
+
 const db = new DatabaseSync(DB_PATH);
 
 // WAL：多读 + 单写互不阻塞；busy_timeout：撞写时等待而非立刻抛 SQLITE_BUSY。
@@ -47,6 +53,14 @@ const stmtUpsert = db.prepare(`
 `);
 const stmtDel = db.prepare('DELETE FROM conversations WHERE uid = ? AND id = ?');
 
+// 配额核算：CAST(... AS BLOB) 让 LENGTH 按字节算（默认 TEXT 是按字符数，CJK 会偏小）。
+const stmtUsage = db.prepare(
+  'SELECT COUNT(*) AS count, COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0) AS bytes FROM conversations WHERE uid = ?'
+);
+const stmtRowLen = db.prepare(
+  'SELECT LENGTH(CAST(data AS BLOB)) AS len FROM conversations WHERE uid = ? AND id = ?'
+);
+
 // 列表：只回元数据（不含 data），供侧栏渲染；正文按需走 getOne。
 function listMeta(uid) {
   return stmtList.all(uid).map((r) => ({
@@ -73,17 +87,32 @@ function getOne(uid, id) {
 }
 
 // 写入/更新：conv = { id, title, createdAt, updatedAt, messages }
+// 返回 { ok: true } 或 { ok: false, code, limit }（超配额）。先核算再写，避免越权撑爆磁盘。
 function upsert(uid, conv) {
   const now = Date.now();
+  const id = String(conv.id);
   const data = JSON.stringify({ messages: Array.isArray(conv.messages) ? conv.messages : [] });
+  const newLen = Buffer.byteLength(data, 'utf8');
+
+  const usage = stmtUsage.get(uid);                 // { count, bytes }
+  const existing = stmtRowLen.get(uid, id);         // 覆盖已有会话不占新名额
+  if (!existing && usage.count >= MAX_CONV_PER_USER) {
+    return { ok: false, code: 'quota_conversations', limit: MAX_CONV_PER_USER };
+  }
+  const oldLen = existing ? existing.len : 0;
+  if (usage.bytes - oldLen + newLen > MAX_BYTES_PER_USER) {
+    return { ok: false, code: 'quota_bytes', limit: MAX_BYTES_PER_USER };
+  }
+
   stmtUpsert.run(
     uid,
-    String(conv.id),
+    id,
     String(conv.title || ''),
     Number(conv.createdAt) || now,
     Number(conv.updatedAt) || now,
     data
   );
+  return { ok: true };
 }
 
 function del(uid, id) {

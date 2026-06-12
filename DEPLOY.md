@@ -153,8 +153,15 @@ docker exec manifold-chat-demo rm -f /data/backup-tmp.db
 
 ## 注意事项
 
-- **安全面**：chat-demo 自己不做鉴权，只是 sub2api 的同源转发器 + 自己的会话库；鉴权/限流/计费全靠
-  sub2api 的账号体系和 API key。**公网开放给陌生人前**仍需补每 IP 限流 / 登录防爆破 / CSP（当前定位自用/熟人）。
+- **安全面**：鉴权/计费仍全靠 sub2api 的账号体系和 API key（chat-demo 不存密码、不存 key）。面向公众的几道闸门已**内置**：
+  - **按 IP 限流**：登录类（`/api/v1/auth/login*`）严格档挡撞密码，`/api /v1 /store` 通用档挡刷接口；超额回 `429 + Retry-After`。
+    额度见 `.env.example`（`RL_*`）。⚠ **必须跑在反代后面**——真实客户端 IP 靠 Caddy 的 `X-Forwarded-For`
+    还原（方式 A 的 Caddyfile 已配 `header_up`）；裸暴露端口时 XFF 可伪造，限流即失效。
+  - **CSP + 安全头**：HTML 响应带严格 `Content-Security-Policy`（脚本/连接/样式全锁同源，无 `unsafe-inline`）
+    + `X-Frame-Options`/`nosniff`/`Referrer-Policy`/`Permissions-Policy`，是模型输出 DOMPurify 之上的兜底。
+  - **每账号存储配额**：单账号对话条数 / 总字节封顶（`STORE_MAX_*`，默认 500 条 / 200MB），防泄露凭证撑爆磁盘。
+  - **仍需人工把关的一条**：注册必须保持**仅管理员开号**（sub2api 侧关闭自助注册）。一旦放开自助注册，
+    陌生人即可烧 ChatGPT Plus / 生图额度——限流挡频率，挡不住"合法但滥用"的账号。
 - **生图进行中刷新页面**：生图是实时请求，刷新会**中断它且不可恢复**——提示词会留下、但不会有结果。这是预期行为。
 - **生图与 CF 100 秒超时**：外层 浏览器→CF→Caddy→chat-demo 仍受 CF ~100 秒首字节限制。默认走流式生图
   （`stream: true`，逐事件 flush），首字节十几秒就到，正常不触发；若上游太老回退非流式、超 100 秒可能 524 ——

@@ -71,6 +71,8 @@ curl -X POST http://localhost:8787/v1/images/generations `
 
 ## 已知边界
 
+- **对外服务的几道闸门已内置**：按 IP 限流（登录防爆破 + 接口防刷）、严格 CSP + 安全头、每账号存储配额。
+  前提是**跑在反代后面**（真实 IP 靠 `X-Forwarded-For`）且**注册保持仅管理员开号**。细节与可调项见 [DEPLOY.md](DEPLOY.md)「注意事项」。
 - 上游账号若开启 Cloudflare Turnstile 人机验证，登录接口会要求 `turnstile_token`，
   本 demo 未集成 Turnstile 小组件（自用一般不开）。
 - 普通聊天模型（gpt-5.x）走文本通道，**永远不会出图**——出图必须切 `gpt-image-2`。
