@@ -20,6 +20,7 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const { Readable } = require('node:stream');
+const crypto = require('node:crypto');
 
 const BASE: string = (process.env.SUB2API_BASE || 'https://zstuacm.xyz').replace(/\/+$/, '');
 const PORT = Number(process.env.PORT || 8787);
@@ -29,10 +30,21 @@ const PUBLIC_DIR = path.join(__dirname, 'public');
 // 迁移期默认保留作回退；生产灰度确认新链路无误后，设 LEGACY_PROXY=off 即下线（无需改代码、可随时回退）。
 const LEGACY_PROXY = (process.env.LEGACY_PROXY || 'on').toLowerCase() !== 'off';
 
+// 旧的整段会话存储（/store/*）。Phase 1 前端已改走 /api/conversations，不再用它。
+// 跑完迁移（migrate-phase1.ts）+ 灰度确认后，设 LEGACY_STORE=off 下线（可回退）。
+const LEGACY_STORE = (process.env.LEGACY_STORE || 'on').toLowerCase() !== 'off';
+
 // ── 会话存储 + 服务端 session（node:sqlite 单文件）──────────────────
 const db = require('./db.ts');
 const STORE_MAX_BODY = 100 * 1024 * 1024;    // /store 单条对话写入上限，防 DB 撑肿
 const CONV_ID_RE = /^[A-Za-z0-9_-]{1,128}$/; // 合法会话 id（与前端 c_xxx 命名一致）
+const HASH_RE = /^[a-f0-9]{64}$/;            // sha256 hex，校验 /api/blobs/:hash 防路径穿越
+
+// blob 二进制存储：内容寻址，落 BLOB_DIR（默认与 DB 同目录的 blobs/，生产命名卷 /data/blobs）。
+const BLOB_DIR: string = process.env.BLOB_DIR || path.join(path.dirname(db.DB_PATH), 'blobs');
+fs.mkdirSync(BLOB_DIR, { recursive: true });
+function blobPath(hash: string): string { return path.join(BLOB_DIR, hash); }
+function sha256(buf: Buffer): string { return crypto.createHash('sha256').update(buf).digest('hex'); }
 
 // cookie 规格：HttpOnly + SameSite=Lax + Path=/。Secure 默认按 X-Forwarded-Proto 自动判定
 // （生产经 Caddy/CF 是 https → 带 Secure；本地直连 http → 不带，否则浏览器拒存 cookie）。
@@ -353,15 +365,6 @@ function maskKey(k: string | null | undefined): string {
   return k.length <= 12 ? k : `${k.slice(0, 7)}…${k.slice(-4)}`;
 }
 
-// 把前端传来的 dataURL 参考图还原成 Blob，供 /v1/images/edits 的 multipart 用。
-function dataUrlToBlob(dataUrl: string): Blob {
-  const i = dataUrl.indexOf(',');
-  const head = dataUrl.slice(0, i);
-  const b64 = dataUrl.slice(i + 1);
-  const mime = (head.match(/^data:(.*?)[;,]/) || [])[1] || 'image/png';
-  return new Blob([Buffer.from(b64, 'base64')], { type: mime });
-}
-
 // ── 上游（sub2api）调用辅助 ─────────────────────────────────────────
 // 复刻前端 unwrap：sub2api 业务接口返回 {code,message,data}，也兼容裸返回。
 function unwrapUpstream(json: any): any {
@@ -590,16 +593,71 @@ async function apiModels(res: ServerResponse, session: any): Promise<void> {
   }
 }
 
-// 聊天 SSE：注入系统提示 + 用 session.api_key 调上游 /v1/chat/completions，流式转发。
-// 0b 不在此落库（前端仍 PUT /store 保存整条会话），落库责任 Phase 1 随 messages 表移到后端。
-async function apiMessages(req: IncomingMessage, res: ServerResponse, session: any): Promise<void> {
-  if (!session.api_key) { sendJson(res, 400, { error: { message: '尚未设置 key，请先在设置里选/贴一个 key' } }); return; }
+// 从新表的 messages 组装上游 /v1/chat/completions 入参：系统提示 + 历史；图片读 blob 转 base64 image_url。
+function buildUpstreamMessages(history: any[]): any[] {
+  const out: any[] = [{ role: 'system', content: CHAT_SYSTEM_PROMPT }];
+  for (const m of history) {
+    if (m.kind === 'error') continue;
+    if (m.role === 'user') {
+      if (m.blobs && m.blobs.length) {
+        const parts: any[] = [];
+        if (m.text) parts.push({ type: 'text', text: m.text });
+        for (const h of m.blobs) {
+          const meta = db.getBlobMeta(h);
+          if (!meta) continue;
+          try {
+            const b64 = fs.readFileSync(blobPath(h)).toString('base64');
+            parts.push({ type: 'image_url', image_url: { url: `data:${meta.mime};base64,${b64}` } });
+          } catch { /* blob 文件缺失则跳过该图 */ }
+        }
+        out.push({ role: 'user', content: parts });
+      } else {
+        out.push({ role: 'user', content: m.text || '' });
+      }
+    } else {
+      // assistant：只回文本（生成的图不回灌，多数后端不收 assistant 图片 part）
+      if (m.text && m.kind !== 'image') out.push({ role: 'assistant', content: m.text });
+    }
+  }
+  return out;
+}
+
+const newMsgId = (): string => 'm_' + crypto.randomBytes(8).toString('hex');
+
+// ── /api/conversations（会话 CRUD，新表；均 readSession 鉴权、uid 隔离）──────────
+function apiConvList(res: ServerResponse, session: any): void {
+  if (session.uid === null) { sendJson(res, 200, { conversations: [] }); return; } // keyonly 用本地存储
+  sendJson(res, 200, { conversations: db.listConvs(session.uid) });
+}
+async function apiConvCreate(req: IncomingMessage, res: ServerResponse, session: any): Promise<void> {
+  if (session.uid === null) { sendJson(res, 400, { error: { message: '贴 key 模式会话存本地' } }); return; }
   let body: any;
   try { body = await readJsonBody(req); } catch { sendJson(res, 400, { error: { message: '请求体非法' } }); return; }
-  const model = body.model;
-  const history = Array.isArray(body.messages) ? body.messages : [];
-  const messages = [{ role: 'system', content: CHAT_SYSTEM_PROMPT }, ...history];
+  const id = (typeof body.id === 'string' && CONV_ID_RE.test(body.id)) ? body.id : ('c_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex'));
+  const title = String(body.title || '新对话');
+  if (!db.getConvMeta(session.uid, id)) db.createConv(session.uid, id, title);
+  sendJson(res, 200, { id, title });
+}
+function apiConvGet(res: ServerResponse, session: any, convId: string): void {
+  if (session.uid === null) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  const meta = db.getConvMeta(session.uid, convId);
+  if (!meta) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  sendJson(res, 200, { ...meta, messages: db.getMessages(convId, session.uid) });
+}
+async function apiConvPatch(req: IncomingMessage, res: ServerResponse, session: any, convId: string): Promise<void> {
+  if (session.uid === null || !db.getConvMeta(session.uid, convId)) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  let body: any;
+  try { body = await readJsonBody(req); } catch { sendJson(res, 400, { error: { message: '请求体非法' } }); return; }
+  db.renameConv(session.uid, convId, String(body.title || ''));
+  sendJson(res, 200, { ok: true });
+}
+function apiConvDelete(res: ServerResponse, session: any, convId: string): void {
+  if (session.uid !== null) db.deleteConv(session.uid, convId);
+  sendJson(res, 200, { ok: true });
+}
 
+// 转发上游 chat SSE 给前端；若传 persist 回调，则边转发边累积 assistant 文本，流结束时调 persist 落库。
+async function streamChatUpstream(res: ServerResponse, apiKey: string, model: any, messages: any[], persist: ((text: string) => void) | null): Promise<void> {
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(new Error('上游超时')), 10 * 60 * 1000);
   res.on('close', () => { if (!res.writableEnded) ctrl.abort(new Error('客户端断开')); });
@@ -608,12 +666,7 @@ async function apiMessages(req: IncomingMessage, res: ServerResponse, session: a
   try {
     upstream = await fetch(BASE + '/v1/chat/completions', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${session.api_key}`,
-        'Accept': 'text/event-stream',
-        'accept-encoding': 'identity',
-      },
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Accept': 'text/event-stream', 'accept-encoding': 'identity' },
       body: JSON.stringify({ model, messages, stream: true }),
       signal: ctrl.signal,
     });
@@ -624,64 +677,171 @@ async function apiMessages(req: IncomingMessage, res: ServerResponse, session: a
   }
 
   const resHeaders: Record<string, string> = {};
-  upstream.headers.forEach((v: string, k: string) => {
-    if (!SKIP_RES_HEADERS.has(k.toLowerCase())) resHeaders[k] = v;
-  });
+  upstream.headers.forEach((v: string, k: string) => { if (!SKIP_RES_HEADERS.has(k.toLowerCase())) resHeaders[k] = v; });
   res.writeHead(upstream.status, resHeaders);
-  if (upstream.body) {
+
+  let assistantText = '';
+  if (upstream.body && upstream.ok) {
     res.flushHeaders();
-    try { await pumpBody(upstream.body, res); }
-    catch (e: any) { console.error(`[messages] stream interrupted: ${e.message}`); }
+    const decoder = new TextDecoder();
+    let sbuf = '';
+    const parse = (chunkText: string) => {
+      sbuf += chunkText;
+      const lines = sbuf.split('\n'); sbuf = lines.pop() || '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const p = t.slice(5).trim();
+        if (!p || p === '[DONE]') continue;
+        try { const d = JSON.parse(p)?.choices?.[0]?.delta?.content; if (d) assistantText += d; } catch { /* 非 JSON delta */ }
+      }
+    };
+    try {
+      for await (const chunk of Readable.fromWeb(upstream.body)) {
+        if (res.destroyed) break;
+        parse(decoder.decode(chunk, { stream: true }));
+        if (!res.write(chunk)) { if (!await drainOnce(res)) break; }
+      }
+    } catch (e: any) { console.error(`[messages] stream interrupted: ${e.message}`); }
+    if (persist && assistantText) persist(assistantText);
+  } else if (upstream.body) {
+    res.flushHeaders();                       // 上游错误（非 200）：转发错误体
+    try { await pumpBody(upstream.body, res); } catch { /* ignore */ }
   }
   clearTimeout(timeout);
   res.end();
 }
 
-// 生图：用 session.api_key 调上游。无参考图走 /v1/images/generations，带参考图走 /v1/images/edits
-// （multipart，从 dataURL 还原 Blob）。默认流式（绕 CF 100s 首字节限），上游不认 stream 时回退非流式。
-async function apiImages(req: IncomingMessage, res: ServerResponse, session: any): Promise<void> {
+// 聊天：登录态落库（{text,attachments:[hash]} → 落 user/assistant、后端组装上下文）；
+// keyonly（无 uid）走代理模式（前端拼 {messages}，不落库）。系统提示统一后端注入。
+async function apiMessages(req: IncomingMessage, res: ServerResponse, session: any, convId: string): Promise<void> {
+  if (!session.api_key) { sendJson(res, 400, { error: { message: '尚未设置 key，请先在设置里选/贴一个 key' } }); return; }
+  let body: any;
+  try { body = await readJsonBody(req); } catch { sendJson(res, 400, { error: { message: '请求体非法' } }); return; }
+  const model = body.model;
+
+  // keyonly：会话存本地，不落后端库；前端拼好的 messages 直接转发。
+  if (session.uid === null) {
+    const history = Array.isArray(body.messages) ? body.messages : [];
+    await streamChatUpstream(res, session.api_key, model, [{ role: 'system', content: CHAT_SYSTEM_PROMPT }, ...history], null);
+    return;
+  }
+
+  // 登录态：落 user 消息 → 后端组装上下文 → 落 assistant。
+  const uid = session.uid;
+  const text = String(body.text || '');
+  const attachments: string[] = Array.isArray(body.attachments) ? body.attachments.filter((h: any) => typeof h === 'string' && HASH_RE.test(h)) : [];
+  if (!text && !attachments.length) { sendJson(res, 400, { error: { message: '空消息' } }); return; }
+  if (!db.getConvMeta(uid, convId)) db.createConv(uid, convId, text.slice(0, 24) || '新对话');
+  const seq = db.nextSeq(convId, uid);
+  const userMsgId = newMsgId();
+  db.insertMessage({ id: userMsgId, convId, uid, seq, role: 'user', kind: 'chat', text });
+  attachments.forEach((h, i) => db.linkBlob(userMsgId, h, i));
+  if (seq === 0 && text) db.renameConv(uid, convId, text.slice(0, 24));
+  db.touchConv(uid, convId);
+
+  const messages = buildUpstreamMessages(db.getMessages(convId, uid));
+  await streamChatUpstream(res, session.api_key, model, messages, (aText) => {
+    db.insertMessage({ id: newMsgId(), convId, uid, seq: db.nextSeq(convId, uid), role: 'assistant', kind: 'chat', model, text: aText });
+    db.touchConv(uid, convId);
+  });
+}
+
+// 背压：单次 drain 等待（客户端消费慢时停一拍）。返回 false 表示连接已关。
+function drainOnce(res: ServerResponse): Promise<boolean> {
+  return new Promise((resolve) => {
+    const onDrain = () => { cleanup(); resolve(true); };
+    const onClose = () => { cleanup(); resolve(false); };
+    const cleanup = () => { res.off('drain', onDrain); res.off('close', onClose); };
+    res.once('drain', onDrain); res.once('close', onClose);
+  });
+}
+
+// 解析上游生图响应（SSE 逐事件 或 整包 JSON），累积出最终图。复刻前端 readImageSse 的宽容逻辑。
+function makeImageParser() {
+  let lastB64: string | null = null, finalB64: string | null = null, finalUrl: string | null = null, revised = '', mime = 'image/png';
+  let sbuf = '';
+  const handle = (j: any) => {
+    if (!j || typeof j !== 'object') return;
+    if (j.output_format) mime = 'image/' + j.output_format;
+    if (j.revised_prompt) revised = j.revised_prompt;
+    const type = j.type || '';
+    if (typeof j.b64_json === 'string' && j.b64_json) { lastB64 = j.b64_json; if (type.includes('completed') || !type) finalB64 = j.b64_json; }
+    else if (typeof j.url === 'string' && j.url) { if (!type.includes('partial')) finalUrl = j.url; }
+    if (Array.isArray(j.data) && j.data.length) { const d = j.data[0]; if (d.b64_json) finalB64 = d.b64_json; else if (d.url) finalUrl = d.url; if (d.revised_prompt) revised = d.revised_prompt; }
+  };
+  return {
+    feedSse(chunkText: string) {
+      sbuf += chunkText;
+      const lines = sbuf.split('\n'); sbuf = lines.pop() || '';
+      for (const line of lines) { const t = line.trim(); if (!t.startsWith('data:')) continue; const p = t.slice(5).trim(); if (!p || p === '[DONE]') continue; try { handle(JSON.parse(p)); } catch { /* */ } }
+    },
+    feedJson(s: string) { try { handle(JSON.parse(s)); } catch { /* */ } },
+    result() { return { b64: finalB64 || lastB64, url: finalUrl, revised, mime }; },
+  };
+}
+
+// 把 dataURL 还原成 {buf,mime}（keyonly 参考图用）。
+function dataUrlToBuf(dataUrl: string): { buf: Buffer; mime: string } {
+  const i = dataUrl.indexOf(',');
+  const head = dataUrl.slice(0, i);
+  const mime = (head.match(/^data:(.*?)[;,]/) || [])[1] || 'image/png';
+  return { buf: Buffer.from(dataUrl.slice(i + 1), 'base64'), mime };
+}
+
+// 生图：登录态落 user 消息 + 结果存 blob 落 kind=image；keyonly（无 uid）走代理模式（dataURL 参考图、不落库）。
+// 调上游 generations / edits multipart，流式绕 CF 100s，不认 stream 回退非流式；边转发边解析最终图。
+async function apiImages(req: IncomingMessage, res: ServerResponse, session: any, convId: string): Promise<void> {
   if (!session.api_key) { sendJson(res, 400, { error: { message: '尚未设置 key，请先在设置里选/贴一个 key' } }); return; }
   let body: any;
   try { body = await readJsonBody(req); } catch { sendJson(res, 400, { error: { message: '请求体非法' } }); return; }
   const { model, prompt, size, quality } = body;
   if (!prompt) { sendJson(res, 400, { error: { message: '缺少 prompt' } }); return; }
-  const refImages: string[] = Array.isArray(body.refs) ? body.refs : [];
+  const keyonly = session.uid === null;
+
+  // 参考图统一成 [{buf,mime}]：keyonly 来自 dataURL；登录态来自 blob hash（并落 user 消息）。
+  let refBlobs: { buf: Buffer; mime: string }[] = [];
+  if (keyonly) {
+    refBlobs = (Array.isArray(body.refs) ? body.refs : [])
+      .filter((u: any) => typeof u === 'string' && u.startsWith('data:'))
+      .map((u: string) => { try { return dataUrlToBuf(u); } catch { return null; } })
+      .filter(Boolean) as { buf: Buffer; mime: string }[];
+  } else {
+    const uid = session.uid;
+    const refs: string[] = Array.isArray(body.refs) ? body.refs.filter((h: any) => typeof h === 'string' && HASH_RE.test(h)) : [];
+    if (!db.getConvMeta(uid, convId)) db.createConv(uid, convId, String(prompt).slice(0, 24));
+    const seq = db.nextSeq(convId, uid);
+    const userMsgId = newMsgId();
+    db.insertMessage({ id: userMsgId, convId, uid, seq, role: 'user', kind: 'chat', text: String(prompt) });
+    refs.forEach((h, i) => db.linkBlob(userMsgId, h, i));
+    if (seq === 0) db.renameConv(uid, convId, String(prompt).slice(0, 24));
+    db.touchConv(uid, convId);
+    refBlobs = refs
+      .map((h) => { try { const meta = db.getBlobMeta(h); return meta ? { buf: fs.readFileSync(blobPath(h)), mime: meta.mime } : null; } catch { return null; } })
+      .filter(Boolean) as { buf: Buffer; mime: string }[];
+  }
 
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(new Error('上游超时')), 10 * 60 * 1000);
   res.on('close', () => { if (!res.writableEnded) ctrl.abort(new Error('客户端断开')); });
 
-  // stream=true 优先；带参考图走 edits(multipart)，否则 generations(JSON)。
   const doRequest = (stream: boolean): Promise<Response> => {
-    if (refImages.length) {
+    if (refBlobs.length) {
       const fd = new FormData();
-      fd.append('model', model);
-      fd.append('prompt', prompt);
-      fd.append('size', size);
-      fd.append('n', '1');
+      fd.append('model', model); fd.append('prompt', prompt); fd.append('size', size); fd.append('n', '1');
       if (quality && quality !== 'auto') fd.append('quality', quality);
       if (stream) { fd.append('stream', 'true'); fd.append('partial_images', '2'); }
-      if (refImages.length === 1) {
-        fd.append('image', dataUrlToBlob(refImages[0]), 'ref-1.png');
+      if (refBlobs.length === 1) {
+        fd.append('image', new Blob([refBlobs[0].buf], { type: refBlobs[0].mime }), 'ref-1.png');
       } else {
-        refImages.forEach((u, i) => fd.append('image[]', dataUrlToBlob(u), `ref-${i + 1}.png`));
+        refBlobs.forEach((b, i) => fd.append('image[]', new Blob([b.buf], { type: b.mime }), `ref-${i + 1}.png`));
       }
-      return fetch(BASE + '/v1/images/edits', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${session.api_key}` },
-        body: fd,
-        signal: ctrl.signal,
-      });
+      return fetch(BASE + '/v1/images/edits', { method: 'POST', headers: { 'Authorization': `Bearer ${session.api_key}` }, body: fd, signal: ctrl.signal });
     }
     const payload: any = { model, prompt, size, n: 1 };
     if (quality && quality !== 'auto') payload.quality = quality;
     if (stream) { payload.stream = true; payload.partial_images = 2; }
-    return fetch(BASE + '/v1/images/generations', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.api_key}` },
-      body: JSON.stringify(payload),
-      signal: ctrl.signal,
-    });
+    return fetch(BASE + '/v1/images/generations', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.api_key}` }, body: JSON.stringify(payload), signal: ctrl.signal });
   };
 
   const forwardError = (status: number, ctype: string | null, text: string) => {
@@ -691,30 +851,59 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
     res.end(text);
   };
 
+  const parser = makeImageParser();
+  // 流结束：登录态把最终图存 blob + 落 kind=image 消息；keyonly 不落（前端本地显示）。
+  const persistImage = () => {
+    if (keyonly) return;
+    const uid = session.uid;
+    const { b64, url, revised, mime } = parser.result();
+    let imgBuf: Buffer | null = null, imgMime = mime;
+    if (b64) { imgBuf = Buffer.from(b64, 'base64'); }
+    else if (url && url.startsWith('data:')) {
+      const ci = url.indexOf(','); const semi = url.indexOf(';');
+      imgMime = (semi > 5 ? url.slice(5, semi) : mime); imgBuf = Buffer.from(url.slice(ci + 1), 'base64');
+    }
+    if (imgBuf && imgBuf.length) {
+      const h = sha256(imgBuf);
+      if (!db.getBlobMeta(h)) { fs.writeFileSync(blobPath(h), imgBuf); db.insertBlob(h, imgMime || 'image/png', imgBuf.length); }
+      const aid = newMsgId();
+      db.insertMessage({ id: aid, convId, uid, seq: db.nextSeq(convId, uid), role: 'assistant', kind: 'image', model, text: revised ? `*${revised}*` : '' });
+      db.linkBlob(aid, h, 0);
+      db.touchConv(uid, convId);
+    }
+  };
+
   try {
     let upstream = await doRequest(true);
     if (!upstream.ok) {
       const errText = await upstream.text();
-      // 只有报错明确冲着 stream/partial_images 参数才回退非流式；内容审核类 400 不重试
       if ((upstream.status === 400 || upstream.status === 422) && /stream|partial/i.test(errText)) {
         upstream = await doRequest(false);
         if (!upstream.ok) { forwardError(upstream.status, upstream.headers.get('content-type'), await upstream.text()); return; }
-      } else {
-        forwardError(upstream.status, upstream.headers.get('content-type'), errText);
-        return;
-      }
+      } else { forwardError(upstream.status, upstream.headers.get('content-type'), errText); return; }
     }
-    // 转发（可能是 SSE 流式，也可能是回退后的整包 JSON）
     const resHeaders: Record<string, string> = {};
-    upstream.headers.forEach((v: string, k: string) => {
-      if (!SKIP_RES_HEADERS.has(k.toLowerCase())) resHeaders[k] = v;
-    });
+    upstream.headers.forEach((v: string, k: string) => { if (!SKIP_RES_HEADERS.has(k.toLowerCase())) resHeaders[k] = v; });
     res.writeHead(upstream.status, resHeaders);
+    const ctype = upstream.headers.get('content-type') || '';
     if (upstream.body) {
       res.flushHeaders();
-      try { await pumpBody(upstream.body, res); }
-      catch (e: any) { console.error(`[images] stream interrupted: ${e.message}`); }
+      if (ctype.includes('event-stream')) {
+        const decoder = new TextDecoder();
+        try {
+          for await (const chunk of Readable.fromWeb(upstream.body)) {
+            if (res.destroyed) break;
+            parser.feedSse(decoder.decode(chunk, { stream: true }));
+            if (!res.write(chunk)) { if (!await drainOnce(res)) break; }
+          }
+        } catch (e: any) { console.error(`[images] stream interrupted: ${e.message}`); }
+      } else {
+        const buf = Buffer.from(await upstream.arrayBuffer());
+        res.write(buf);
+        parser.feedJson(buf.toString('utf8'));
+      }
     }
+    persistImage();
     clearTimeout(timeout);
     res.end();
   } catch (e: any) {
@@ -724,6 +913,36 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
       else res.end();
     }
   }
+}
+
+// 上传 blob：sha256 内容寻址 + 去重。已存在直接返回，不重复写盘。
+async function apiBlobUpload(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let buf: Buffer;
+  try { buf = await collectBody(req); } catch (err: any) { sendJson(res, err.statusCode || 400, { error: { message: err.message } }); return; }
+  if (!buf.length) { sendJson(res, 400, { error: { message: '空请求体' } }); return; }
+  const mime = String(req.headers['content-type'] || 'application/octet-stream').split(';')[0].trim();
+  const hash = sha256(buf);
+  if (!db.getBlobMeta(hash)) {
+    fs.writeFileSync(blobPath(hash), buf);
+    db.insertBlob(hash, mime, buf.length);
+  }
+  sendJson(res, 200, { hash, mime, size: buf.length });
+}
+
+// 读 blob：必须校验当前 session.uid 拥有引用该 hash 的消息，否则 404（防越权读他人图）。
+function apiBlobGet(res: ServerResponse, session: any, hash: string): void {
+  if (session.uid === null || !db.userOwnsBlob(session.uid, hash)) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  const meta = db.getBlobMeta(hash);
+  if (!meta) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  let buf: Buffer;
+  try { buf = fs.readFileSync(blobPath(hash)); } catch { sendJson(res, 404, { error: { message: 'blob 文件缺失' } }); return; }
+  res.writeHead(200, {
+    'Content-Type': meta.mime,
+    'Content-Length': String(buf.length),
+    'Cache-Control': 'public, max-age=31536000, immutable',  // 内容寻址，可永久强缓存
+    ...SECURITY_HEADERS,
+  });
+  res.end(buf);
 }
 
 // /api/* 路由分发。返回 true 表示已接管。
@@ -756,16 +975,38 @@ async function handleApi(req: IncomingMessage, res: ServerResponse): Promise<voi
   if (url === '/api/keys/select' && method === 'POST') return apiKeysSelect(req, res, session);
   if (url === '/api/keys/manual' && method === 'POST') return apiKeysManual(req, res, session);
   if (url === '/api/models' && method === 'GET') return apiModels(res, session);
+  if (url === '/api/blobs' && method === 'POST') return apiBlobUpload(req, res);
+  const mBlob = /^\/api\/blobs\/([^/]+)$/.exec(url);
+  if (mBlob && method === 'GET') {
+    const h = decodeURIComponent(mBlob[1]);
+    if (!HASH_RE.test(h)) { sendJson(res, 400, { error: { message: '非法 blob hash' } }); return; }
+    return apiBlobGet(res, session, h);
+  }
 
+  // 会话集合
+  if (url === '/api/conversations' && method === 'GET') return apiConvList(res, session);
+  if (url === '/api/conversations' && method === 'POST') return apiConvCreate(req, res, session);
+  // 会话子路由：消息 / 生图（两段路径，先于单条会话匹配）
   const mMsg = /^\/api\/conversations\/([^/]+)\/messages$/.exec(url);
   if (mMsg && method === 'POST') {
-    if (!CONV_ID_RE.test(decodeURIComponent(mMsg[1]))) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
-    return apiMessages(req, res, session);
+    const cid = decodeURIComponent(mMsg[1]);
+    if (!CONV_ID_RE.test(cid)) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
+    return apiMessages(req, res, session, cid);
   }
   const mImg = /^\/api\/conversations\/([^/]+)\/images$/.exec(url);
   if (mImg && method === 'POST') {
-    if (!CONV_ID_RE.test(decodeURIComponent(mImg[1]))) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
-    return apiImages(req, res, session);
+    const cid = decodeURIComponent(mImg[1]);
+    if (!CONV_ID_RE.test(cid)) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
+    return apiImages(req, res, session, cid);
+  }
+  // 单条会话：GET / PATCH / DELETE
+  const mConv = /^\/api\/conversations\/([^/]+)$/.exec(url);
+  if (mConv) {
+    const cid = decodeURIComponent(mConv[1]);
+    if (!CONV_ID_RE.test(cid)) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
+    if (method === 'GET') return apiConvGet(res, session, cid);
+    if (method === 'PATCH') return apiConvPatch(req, res, session, cid);
+    if (method === 'DELETE') return apiConvDelete(res, session, cid);
   }
 
   sendJson(res, 404, { error: { message: 'not found' } });
@@ -776,7 +1017,8 @@ function isOwnApi(url: string): boolean {
   return url.startsWith('/api/session/')
     || url === '/api/keys' || url === '/api/keys/select' || url === '/api/keys/manual'
     || url === '/api/models'
-    || /^\/api\/conversations\/[^/]+\/(messages|images)/.test(url);
+    || url === '/api/blobs' || /^\/api\/blobs\/[^/]+$/.test(url)
+    || url === '/api/conversations' || /^\/api\/conversations\/[^/]+/.test(url);
 }
 
 // ── 会话存储 /store/*（按 session.uid 隔离）─────────────────────────
@@ -882,6 +1124,10 @@ const server = http.createServer((req: IncomingMessage, res: ServerResponse) => 
     if (rateLimited(req, res)) return;   // 限流闸门：挡在所有路由之前
     const url = req.url || '';
     if (url.startsWith('/store/')) {
+      if (!LEGACY_STORE) {   // 旧整段存储已下线（LEGACY_STORE=off）
+        sendJson(res, 404, { error: { message: '该端点已下线（旧 /store），请使用 /api/conversations', type: 'legacy_disabled' } });
+        return;
+      }
       handleStore(req, res).catch((err: any) => {
         console.error('[store] unhandled:', err);
         if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });

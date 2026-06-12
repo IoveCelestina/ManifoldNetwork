@@ -2,7 +2,7 @@
  *
  * 0b 起：浏览器不再持 key/JWT —— 凭证活在服务端 session，浏览器只有一个 httpOnly cookie。
  * 所有推理/登录/key 操作都走本服务同源 /api/*（cookie 自动随请求带上）。
- * 账号登录的会话存服务端 /store；免登录贴 key（keyonly）的会话存本地 IndexedDB。
+ * 账号登录的会话存服务端 /api/conversations（messages/blobs 表）；免登录贴 key（keyonly）存本地 IndexedDB。
  */
 'use strict';
 
@@ -101,7 +101,7 @@ async function postJson(path, body) {
   return json || {};
 }
 
-// 需登录态的请求（/store/*、/api/keys）：401 视为 session 失效 → 踢回登录页。
+// 需登录态的请求（/api/conversations、/api/keys 等）：401 视为 session 失效 → 踢回登录页。
 async function authedFetch(path, opts = {}) {
   const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
   const res = await fetch(path, Object.assign({}, opts, { headers }));
@@ -132,48 +132,46 @@ function handleSessionExpired() {
   showLogin('登录已过期，请重新登录');
 }
 
-/* ───────────────────── 会话存储抽象（登录→后端 /store / keyonly→本地 IndexedDB） ───────────────────── */
+/* ─────────────── 会话存储抽象（登录→后端 /api/conversations / keyonly→本地 IndexedDB） ─────────────── */
 
-// 账号登录（有 uid）→ 走后端 /store；keyonly（无 uid）→ 走本地 IndexedDB。
+// 账号登录（有 uid）→ 走后端 /api/conversations；keyonly（无 uid）→ 走本地 IndexedDB。
 function useServer() { return state.me?.uid != null; }
-
-// 只把要持久化的字段发后端，剔除运行时标记
-function serializeConv(conv) {
-  return {
-    id: conv.id,
-    title: conv.title,
-    createdAt: conv.createdAt,
-    updatedAt: conv.updatedAt,
-    messages: Array.isArray(conv.messages) ? conv.messages : [],
-  };
-}
 
 const store = {
   async list() {
     if (useServer()) {
-      const data = await authedFetch('/store/conversations');
+      const data = await authedFetch('/api/conversations');
       return (data?.conversations || []).map((c) => ({ ...c, messages: null }));
     }
     return await idbAll();
   },
   async get(id) {
-    if (useServer()) return await authedFetch(`/store/conversations/${encodeURIComponent(id)}`);
+    if (useServer()) return await authedFetch(`/api/conversations/${encodeURIComponent(id)}`);
     return state.convs.find((c) => c.id === id) || null;
   },
-  async put(conv) {
-    if (useServer()) {
-      await authedFetch(`/store/conversations/${encodeURIComponent(conv.id)}`, {
-        method: 'PUT', body: JSON.stringify(serializeConv(conv)),
-      });
-      return;
-    }
-    await idbPut(conv);
-  },
   async del(id) {
-    if (useServer()) { await authedFetch(`/store/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }); return; }
+    if (useServer()) { await authedFetch(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }); return; }
     await idbDel(id);
   },
 };
+
+// dataURL → Blob（手动解析；不能用 fetch(data:)，会被 CSP connect-src 'self' 拦成 Failed to fetch）。
+function dataUrlToBlob(dataUrl) {
+  const [head, b64] = dataUrl.split(',');
+  const mime = (head.match(/^data:(.*?)[;,]/) || [])[1] || 'image/png';
+  const bin = atob(b64);
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+  return new Blob([arr], { type: mime });
+}
+
+// 把 dataURL 图片上传到 /api/blobs，返回内容寻址 hash（登录态用：base64 不再进会话 JSON）。
+async function uploadDataUrl(dataUrl) {
+  const blob = dataUrlToBlob(dataUrl);
+  const res = await fetch('/api/blobs', { method: 'POST', headers: { 'Content-Type': blob.type || 'image/png' }, body: blob });
+  if (!res.ok) { let m = '图片上传失败'; try { m = (await res.json())?.error?.message || m; } catch { /* 非 JSON */ } throw new Error(m); }
+  return (await res.json()).hash;
+}
 
 // 按需加载：把某会话 messages 从后端补全（本地模式或已加载则直接返回）
 async function ensureMessages(conv) {
@@ -213,27 +211,10 @@ async function loadConversations() {
   state.currentId = state.convs[0]?.id || null;
 }
 
-// 老数据迁移：首次进入 server 模式时，若本机 IndexedDB 还存着对话，问一次是否导入到账号
-let migrating = false;
-async function maybeMigrateLocal() {
-  if (migrating || !useServer()) return;
-  if (localStorage.getItem('mfchat_migrated')) return;
-  let local = [];
-  try { local = await idbAll(); } catch { return; }
-  localStorage.setItem('mfchat_migrated', '1');
-  if (!local.length) return;
-  if (!confirm(`检测到本机有 ${local.length} 个本地对话，导入到当前账号并云端同步？\n（导入后会从本机移除本地副本）`)) return;
-  migrating = true;
-  let done = 0;
-  for (const conv of local) {
-    try { await store.put(conv); done++; } catch (e) { console.warn('迁移失败', conv.id, e); }
-  }
-  try { await idbClear(); } catch { /* 清本地失败不致命 */ }
-  await loadConversations();
-  migrating = false;
-  if (state.currentId) openConv(state.currentId); else { renderConvList(); renderMessages(); }
-  alert(`已导入 ${done}/${local.length} 个对话。`);
-}
+// Phase 1：登录态会话用后端新数据模型（messages/blobs 表）。把本地 IndexedDB 会话（keyonly 时存的）
+// 自动导入到账号需要后端迁移支持，暂缓——本地副本保留不动，登录态用后端会话。
+// （0b 的「整段 PUT /store 导入」随 /store 下线一并移除。）
+async function maybeMigrateLocal() { /* no-op：见上说明 */ }
 
 /* ───────────────────────── 登录视图 ───────────────────────── */
 
@@ -578,9 +559,12 @@ let persistWarned = false;
 
 async function persistConv(conv) {
   conv.updatedAt = Date.now();
+  // 登录态：消息由后端落库（发消息时），前端不再整段保存，仅刷新侧栏。
+  if (useServer()) { renderConvList(); return true; }
+  // keyonly：存本地 IndexedDB
   let ok = true;
   try {
-    await store.put(conv);
+    await idbPut(conv);
   } catch (e) {
     ok = false;
     console.warn('persist failed', e);
@@ -591,8 +575,7 @@ async function persistConv(conv) {
       }
     } else if (!persistWarned) {
       persistWarned = true;
-      const where = useServer() ? '未能同步到服务器' : '刷新页面后可能丢失';
-      alert(`对话保存失败：${e?.message || e}\n当前对话本次仍可继续，但${where}。`);
+      alert(`对话保存失败：${e?.message || e}\n当前对话本次仍可继续，但刷新页面后可能丢失。`);
     }
   }
   renderConvList();
@@ -691,6 +674,12 @@ function buildEmptyState() {
   return div;
 }
 
+// 消息图片来源：登录态是 blobs:[hash]（→ /api/blobs/:hash）；keyonly 是 images:[dataUrl]。
+function msgImageUrls(m) {
+  if (m.blobs?.length) return m.blobs.map((h) => `/api/blobs/${encodeURIComponent(h)}`);
+  return m.images || [];
+}
+
 function buildMsgEl(m) {
   const div = document.createElement('div');
   if (m.role === 'user') {
@@ -698,7 +687,8 @@ function buildMsgEl(m) {
     const body = document.createElement('div');
     body.className = 'msg-body';
     body.textContent = m.text || '';
-    if (m.images?.length) body.appendChild(buildImages(m.images, false));
+    const uImgs = msgImageUrls(m);
+    if (uImgs.length) body.appendChild(buildImages(uImgs, false));
     div.appendChild(body);
   } else if (m.kind === 'error') {
     div.className = 'msg msg-error';
@@ -717,7 +707,8 @@ function buildMsgEl(m) {
     const body = document.createElement('div');
     body.className = 'msg-body md';
     body.innerHTML = mdRender(m.text || '');
-    if (m.images?.length) body.appendChild(buildImages(m.images, true));
+    const aImgs = msgImageUrls(m);
+    if (aImgs.length) body.appendChild(buildImages(aImgs, true));
     div.appendChild(body);
   }
   return div;
@@ -981,6 +972,7 @@ async function sendChat(text) {
   const conv = currentConv() || newConv();
   await ensureMessages(conv);
   const model = currentModel();
+  const imgs = state.attachments.map((a) => a.dataUrl);  // 发送前取（pushUserMessage 会清空 attachments）
   pushUserMessage(conv, text);
   await persistConv(conv);
 
@@ -1006,12 +998,22 @@ async function sendChat(text) {
   };
 
   try {
-    const res = await fetch(`/api/conversations/${encodeURIComponent(conv.id)}/messages`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: buildApiMessages(conv) }),
-      signal: ctrl.signal,
-    });
+    let res;
+    if (useServer()) {
+      // 登录态：图片先传 /api/blobs 拿 hash，后端落库 + 组装上下文（发 {text, attachments:[hash]}）
+      let hashes = [];
+      if (imgs.length) hashes = await Promise.all(imgs.map(uploadDataUrl));
+      res = await fetch(`/api/conversations/${encodeURIComponent(conv.id)}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, text, attachments: hashes }), signal: ctrl.signal,
+      });
+    } else {
+      // keyonly：前端拼上下文（不落后端库）
+      res = await fetch(`/api/conversations/${encodeURIComponent(conv.id)}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: buildApiMessages(conv) }), signal: ctrl.signal,
+      });
+    }
 
     if (!res.ok) {
       const errText = await res.text();
@@ -1181,11 +1183,12 @@ async function sendImageGen(prompt) {
   setSending(true);
 
   try {
-    // 流式/回退由后端处理；前端只发一次，后端用 session.api_key 调上游。
+    // 登录态：参考图先传 /api/blobs 拿 hash（refs:[hash]）；keyonly：直接发 dataURL。流式/回退由后端处理。
+    const refs = useServer() && refImages.length ? await Promise.all(refImages.map(uploadDataUrl)) : refImages;
     const res = await fetch(`/api/conversations/${encodeURIComponent(conv.id)}/images`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, prompt, size, quality, refs: refImages }),
+      body: JSON.stringify({ model, prompt, size, quality, refs }),
       signal: ctrl.signal,
     });
 
