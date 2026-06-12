@@ -846,18 +846,27 @@ function scrollToBottom(force) {
 $('btn-attach').addEventListener('click', () => $('file-input').click());
 
 $('file-input').addEventListener('change', async (e) => {
-  for (const file of e.target.files) {
-    if (state.attachments.length >= MAX_ATTACH) break;
+  await addFiles(e.target.files);
+  e.target.value = '';
+});
+
+// 统一入口：点选 / 粘贴 / 拖拽都走这里——只收图片、压缩、push、重渲染。返回实际加入张数。
+async function addFiles(fileList) {
+  const files = Array.from(fileList || []).filter((f) => (f.type || '').startsWith('image/'));
+  let added = 0;
+  for (const file of files) {
+    if (state.attachments.length >= MAX_ATTACH) break;   // 满 4 张后忽略多余（与点选行为一致）
     try {
       const dataUrl = await fileToDataUrl(file);
       state.attachments.push({ dataUrl });
+      added++;
     } catch (err) {
       alert(`读取图片失败：${err.message}`);
     }
   }
-  e.target.value = '';
-  renderAttachments();
-});
+  if (added) renderAttachments();
+  return added;
+}
 
 async function fileToDataUrl(file) {
   const raw = await new Promise((resolve, reject) => {
@@ -907,6 +916,54 @@ function renderAttachments() {
   });
   syncSizeOptions();
 }
+
+// Ctrl/⌘+V 粘贴图片（截图、网页里复制的图）：剪贴板含图片文件才介入，纯文本粘贴照常进输入框。
+document.addEventListener('paste', (e) => {
+  if ($('view-app').classList.contains('hidden')) return;     // 登录页不处理
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  const files = [];
+  for (const it of items) {
+    if (it.kind === 'file' && (it.type || '').startsWith('image/')) {
+      const f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  }
+  if (!files.length) return;          // 没有图片 → 不拦截，让文本正常粘贴
+  e.preventDefault();
+  addFiles(files);
+});
+
+// 拖拽图片到窗口任意处上传；拖拽期间显示提示遮罩。dragDepth 计数抵消子元素进出造成的抖动。
+const dropOverlay = $('drop-overlay');
+let dragDepth = 0;
+const isFileDrag = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+const showDrop = (on) => dropOverlay && dropOverlay.classList.toggle('hidden', !on);
+
+window.addEventListener('dragenter', (e) => {
+  if ($('view-app').classList.contains('hidden') || !isFileDrag(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  showDrop(true);
+});
+window.addEventListener('dragover', (e) => {
+  if ($('view-app').classList.contains('hidden') || !isFileDrag(e)) return;
+  e.preventDefault();                 // 必须阻止默认，否则 drop 不会触发
+  e.dataTransfer.dropEffect = 'copy';
+});
+window.addEventListener('dragleave', (e) => {
+  if (!isFileDrag(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (dragDepth === 0) showDrop(false);
+});
+window.addEventListener('drop', (e) => {
+  if (!isFileDrag(e)) return;
+  e.preventDefault();                 // 否则浏览器会直接打开拖入的图片
+  dragDepth = 0;
+  showDrop(false);
+  if ($('view-app').classList.contains('hidden')) return;
+  addFiles(e.dataTransfer.files);     // addFiles 内部已过滤非图片
+});
 
 /* ───────────────────────── 发送 ───────────────────────── */
 
