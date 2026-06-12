@@ -67,6 +67,7 @@ async function idbPut(conv) {
     tx.objectStore('conv').put(conv);
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('IndexedDB 写入事务被中止'));
   });
 }
 async function idbDel(id) {
@@ -76,6 +77,7 @@ async function idbDel(id) {
     tx.objectStore('conv').delete(id);
     tx.oncomplete = resolve;
     tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error || new Error('IndexedDB 删除事务被中止'));
   });
 }
 
@@ -424,6 +426,18 @@ function syncComposerMode() {
   $('composer-hint').textContent = img
     ? '生图模式 · 直接描述 = 文生图 · 附图 = 按参考图改图'
     : 'Enter 发送 · Shift+Enter 换行';
+  syncSizeOptions();
+}
+
+// 2K(2048×2048) 只有文生图 /generations 支持；改图 /edits 接口上限 1536。
+// 因此一旦带了参考图（改图模式）就禁用 2K，并把已选中的 2K 退回到合法尺寸。
+function syncSizeOptions() {
+  const sel = $('size-select');
+  const big = sel.querySelector('option[value="2048x2048"]');
+  if (!big) return;
+  const editMode = state.attachments.length > 0;
+  big.disabled = editMode;
+  if (editMode && sel.value === '2048x2048') sel.value = '1024x1024';
 }
 
 /* ───────────────────────── 会话 ───────────────────────── */
@@ -448,19 +462,29 @@ function currentConv() {
 }
 
 let quotaWarned = false;
+let persistWarned = false;
 
 async function persistConv(conv) {
   conv.updatedAt = Date.now();
+  let ok = true;
   try {
     await idbPut(conv);
   } catch (e) {
+    ok = false;
     console.warn('persist failed', e);
-    if (e?.name === 'QuotaExceededError' && !quotaWarned) {
-      quotaWarned = true;
-      alert('浏览器存储空间已满，本次对话无法持久保存。\n建议删掉旧对话（特别是含生成图片的），或把重要图片先下载下来。');
+    if (e?.name === 'QuotaExceededError') {
+      if (!quotaWarned) {
+        quotaWarned = true;
+        alert('浏览器存储空间已满，本次对话无法持久保存。\n建议删掉旧对话（特别是含生成图片的），或把重要图片先下载下来。');
+      }
+    } else if (!persistWarned) {
+      // 其它写入失败（事务被中止、隐私模式禁用 IndexedDB 等）：本次仍能用，但刷新会丢，得让用户知道
+      persistWarned = true;
+      alert(`对话保存失败：${e?.message || e}\n当前对话在本次浏览中仍可继续，但刷新页面后可能丢失。`);
     }
   }
   renderConvList();
+  return ok;
 }
 
 function renderConvList() {
@@ -684,6 +708,7 @@ function renderAttachments() {
     chip.appendChild(del);
     box.appendChild(chip);
   });
+  syncSizeOptions();
 }
 
 /* ───────────────────────── 发送 ───────────────────────── */
@@ -710,13 +735,13 @@ function onSend() {
   const text = inputBox.value.trim();
   if (!text && !state.attachments.length) return;
   if (!state.apiKey) { openSettings(); return; }
+  if (isImageMode() && !text) return; // 生图必须有描述，光有参考图不行
 
-  if (isImageMode()) {
-    if (!text) return; // 生图必须有描述，光有参考图不行
-    sendImageGen(text);
-  } else {
-    sendChat(text);
-  }
+  // 立刻占位：sendChat/sendImageGen 要在 await persistConv 之后才设真正的 AbortController，
+  // 这中间的异步窗口里若再次点击/回车会发出并发请求。先占位堵住，内部会用真 controller 覆盖。
+  state.streaming = new AbortController();
+  if (isImageMode()) sendImageGen(text);
+  else sendChat(text);
 }
 
 function setSending(on) {
@@ -856,7 +881,8 @@ async function sendChat(text) {
       for (const line of lines) handleSseLine(line);
     }
     buf += decoder.decode(); // flush 解码器残留
-    if (buf.trim()) handleSseLine(buf); // 流结束时缓冲里可能还压着最后一行
+    // 流结束时缓冲里可能压着不止一行（上游不以 [DONE] 收尾时），逐行处理，别丢掉末尾内容
+    for (const line of buf.split('\n')) if (line.trim()) handleSseLine(line);
     if (!aMsg.text) aMsg.text = '（空响应）';
     renderStream(true);
   } catch (err) {
@@ -957,7 +983,7 @@ async function readImageSse(res, pendingEl) {
     for (const line of lines) handleLine(line);
   }
   buf += decoder.decode();
-  if (buf.trim()) handleLine(buf);
+  for (const line of buf.split('\n')) if (line.trim()) handleLine(line);
 
   const b64 = finalB64 || lastB64; // 没收到 completed 事件就拿最后一张 partial 兜底
   const images = [];
@@ -971,10 +997,11 @@ async function sendImageGen(prompt) {
   if (!prompt) return;
   const conv = currentConv() || newConv();
   const model = currentModel();
-  const size = $('size-select').value;
+  let size = $('size-select').value;
   const quality = $('quality-select').value;
   const userMsg = pushUserMessage(conv, prompt);
   const refImages = userMsg.images || []; // 附了参考图 → 走 edits 按图改图
+  if (refImages.length && size === '2048x2048') size = '1024x1024'; // edits 接口不支持 2K，退回合法尺寸
   await persistConv(conv);
 
   // 等待画面：脉冲环 + 计时器
