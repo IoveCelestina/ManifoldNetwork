@@ -1,0 +1,17 @@
+{
+  "//": "仅供本地类型检查 / 编辑器提示：npm run typecheck（tsc --noEmit）。运行时不读本文件——Node 24 直接 type-strip 跑 .ts。",
+  "compilerOptions": {
+    "target": "es2023",
+    "lib": ["es2023"],
+    "module": "node16",
+    "moduleResolution": "node16",
+    "types": ["node"],
+    "noEmit": true,
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "erasableSyntaxOnly": true
+  },
+  "include": ["server.ts", "db.ts"]
+}

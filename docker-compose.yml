@@ -16,6 +16,8 @@ services:
     image: manifold/chat-demo:local
     container_name: manifold-chat-demo
     restart: unless-stopped
+    # 优雅关闭：默认 10s 太短会硬掐在途 SSE 流；留 35s 让后端排空（配合 SHUTDOWN_TIMEOUT_MS=30000）
+    stop_grace_period: 35s
     environment:
       # 指向同机 sub2api（host-gateway 解析到宿主机）。
       # sub2api 如果发布在宿主机别的端口，改 .env 里的 SUB2API_BASE

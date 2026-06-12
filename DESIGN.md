@@ -13,8 +13,12 @@
 | 存储 | **后端拥有**，仍用 SQLite + 卷里 blob 文件 |
 | 身份/计费 | **继续挂 sub2api**（后端验 token，沿用邀请制） |
 | 前端 | 暂**不重写**，把现有 vanilla UI 从「大脑」瘦成「瘦客户端」，重指向后端 API |
+| 后端语言 | **TypeScript**（Node 运行时）。否决 Go——本服务是 I/O 密集 + 小用户量，瓶颈在上游 sub2api / SQLite 单写锁 / CF 100s，不在语言层；TS 与现状 JS 同源、前后端可共享类型，最贴合「刻意不重」 |
 | 文件处理 | **先不做**（Phase 2 再说） |
 | 不做（非目标） | Postgres、消息队列、RAG/向量库、代码解释器、自有账号体系、多租户计费 |
+
+> **TS 落地形态（仍是「零依赖 / 无构建」）**：Dockerfile 已是 `node:24-alpine`，Node 24 原生 type stripping，直接 `node server.ts` 跑——**不加构建步骤、不加运行时依赖**。`typescript` 仅作 devDependency 供本地类型检查 / 编辑器提示，镜像里没有 `dist/`，Dockerfile 仅把 `.js` 换成 `.ts`。SQLite 继续用内置 `node:sqlite`（自带类型）。前端仍 vanilla，不参与 TS 化。
+> ⚠ type stripping 不支持 `enum` / `namespace` / 参数属性等「需运行时代码生成」的特性——用 union 字面量类型替代 `enum` 即可，本项目用不到那些。
 
 ## 1. 拓扑
 
@@ -200,11 +204,12 @@ for 每个旧 conversations 行:
 
 ## 9. 待确认 / TODO
 
-1. **上游 `/v1` 认什么凭证**：`sk-` key 还是也认 JWT？认 JWT 则 §2 可省「代取 key」一步。实现时一测便知。
+1. **上游 `/v1` 是否也认 JWT**（优化项，不阻塞）：现状已验证认 `sk-` key（前端当前就在用），Phase 0 直接沿用 `sk-`。若上游 `/v1` 也认 JWT，则 §2 可省掉「登录后代取 key」一步——实现时顺手一测便知，测不出也不影响落地。
 2. **免登录贴 key 模式**是否保留（§2）。建议保留，作为临时 session。
-3. **session 存哪**：SQLite 表（重启不掉线，推荐）还是内存（重启需重登）。
-4. **窗口截断策略**：先简单截断，后续可加摘要。
-5. **前端何时上框架**：UI 复杂度顶上来再上 React/Svelte；Phase 0/1 仍用现 vanilla。
+3. **窗口截断策略**：先简单截断，后续可加摘要。
+4. **前端何时上框架**：UI 复杂度顶上来再上 React/Svelte；Phase 0/1 仍用现 vanilla。
+
+> session 存储已拍板用 SQLite `sessions` 表（重启不掉线，见 §3 DDL），不再列为待定。
 
 ## 10. 分阶段
 
@@ -212,6 +217,7 @@ for 每个旧 conversations 行:
   - 加 `sessions` + httpOnly cookie 鉴权；登录/2FA/刷新/登出移服务端。
   - `/api/conversations/:id/messages`、`/images`、`/models` 服务端调上游 + SSE。
   - 前端重指向这些 API，删除客户端持 key / 拼 prompt。
+  - **SIGTERM 优雅关闭**（见 §8）：排空在途流、刷 WAL 再退。后端一进关键路径，重启就不能再掐断所有人的流——此项与上线同步交付，不能缓。
   - **存储先沿用现 blob 模型**（最小风险）。下线浏览器直打 `/v1`。
 - **Phase 1 ｜ 拆数据模型**
   - 建 `conversations/messages/blobs/message_blobs`，加 `/api/blobs`。
