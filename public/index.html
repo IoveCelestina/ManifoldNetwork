@@ -90,10 +90,7 @@
       <div class="me-line" id="me-line">
         <span class="me-dot"></span>
         <span class="me-label" id="me-label">未登录</span>
-      </div>
-      <div class="sidebar-actions">
-        <button class="btn btn-ghost btn-small" id="btn-settings">设置</button>
-        <button class="btn btn-ghost btn-small" id="btn-logout">退出</button>
+        <button class="btn btn-ghost btn-small btn-logout" id="btn-logout">退出</button>
       </div>
     </div>
   </aside>
@@ -139,12 +136,14 @@
           <textarea id="input-box" rows="1" placeholder="输入消息…"></textarea>
           <div class="imagegen-controls hidden" id="imagegen-controls">
             <select id="size-select" title="生成尺寸">
-              <option value="1024x1024">原生·1:1</option>
-              <option value="1536x1024">原生·3:2</option>
-              <option value="1024x1536">原生·2:3</option>
-              <option value="2048x2048">2K·1:1</option>
-              <option value="2880x2880">4K·1:1</option>
-              <option value="3456x2304">4K·3:2</option>
+              <option value="auto">auto</option>
+              <option value="1024x1024" selected>1024×1024</option>
+              <option value="1536x1024">1536×1024</option>
+              <option value="1024x1536">1024×1536</option>
+              <option value="2048x2048">2048×2048</option>
+              <option value="2048x1152">2048×1152</option>
+              <option value="3840x2160">3840×2160</option>
+              <option value="2160x3840">2160×3840</option>
             </select>
             <select id="quality-select" title="质量档位：低档更快更省">
               <option value="auto">质量·auto</option>
@@ -162,31 +161,68 @@
 
   <!-- 设置弹层 -->
   <div class="modal-mask hidden" id="settings-mask">
-    <div class="modal" role="dialog" aria-label="设置">
-      <h2 class="modal-title">设置</h2>
+    <div class="sx-modal" role="dialog" aria-label="设置">
 
-      <section class="modal-section">
-        <h3 class="modal-section-title">API Key</h3>
-        <div id="key-account-zone" class="hidden">
-          <p class="modal-text">从账户选择（生图需要 <span class="mono">openai</span> 平台分组的 key）：</p>
-          <div class="key-list" id="key-list"></div>
-          <button class="btn btn-ghost btn-small" id="btn-refresh-keys">刷新列表</button>
+      <div class="sx-head">
+        <div class="sx-title">
+          <svg class="sx-title-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <h2>设置</h2>
         </div>
-        <p class="modal-text">或手动粘贴：</p>
-        <div class="key-paste-row">
-          <input type="password" id="settings-key-input" class="mono" placeholder="sk-...">
-          <button class="btn btn-primary btn-small" id="btn-use-key">使用</button>
-        </div>
-      </section>
-
-      <section class="modal-section">
-        <h3 class="modal-section-title">连接</h3>
-        <p class="modal-text">上游 sub2api：<span class="mono" id="settings-upstream"></span></p>
-      </section>
-
-      <div class="modal-actions">
-        <button class="btn btn-ghost" id="btn-close-settings">关闭</button>
+        <button class="sx-close" id="btn-close-settings-x" aria-label="关闭">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
       </div>
+
+      <div class="sx-body">
+
+        <section class="sx-section">
+          <div class="sx-sec-head">
+            <span class="sx-sec-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4"/><path d="M18 5l2 2"/><path d="M15 8l2 2"/></svg>
+              API Key
+            </span>
+            <button class="sx-refresh" id="btn-refresh-keys">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              刷新
+            </button>
+          </div>
+          <p class="sx-hint" id="key-hint">从账户选择一个 key，生图需 <code>openai</code> 平台分组</p>
+
+          <div class="sx-keylist" id="key-list"></div>
+
+          <div class="sx-paste">
+            <div class="sx-paste-field">
+              <svg class="sx-paste-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="M10.85 12.15 19 4"/><path d="M18 5l2 2"/><path d="M15 8l2 2"/></svg>
+              <input type="password" id="settings-key-input" class="mono" placeholder="sk-…  手动粘贴">
+            </div>
+            <button class="btn btn-primary btn-small sx-use" id="btn-use-key">使用</button>
+          </div>
+        </section>
+
+        <section class="sx-section">
+          <div class="sx-sec-head">
+            <span class="sx-sec-title">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
+              连接
+            </span>
+          </div>
+          <div class="sx-conn">
+            <span class="sx-conn-status"></span>
+            <span class="sx-conn-label">上游 sub2api</span>
+            <span class="sx-conn-url" id="settings-upstream"></span>
+          </div>
+        </section>
+
+      </div>
+
+      <div class="sx-foot">
+        <button class="btn btn-ghost" id="btn-close-settings">关闭</button>
+        <button class="btn btn-primary" id="btn-confirm-settings">确定</button>
+      </div>
+
     </div>
   </div>
 

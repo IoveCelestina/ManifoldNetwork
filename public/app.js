@@ -453,34 +453,75 @@ async function loadAccountKeys() {
   return keys;
 }
 
+const SVG_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+const SVG_PENCIL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+
+function makeKeyRow(k, active) {
+  const plat = (k.platform || '').toLowerCase();
+  const known = plat === 'openai' || plat === 'anthropic' || plat === 'gemini';
+  const row = document.createElement('button');
+  row.className = 'sx-key is-' + (known ? plat : 'other') + (k.key && k.key === active ? ' selected' : '');
+  row.innerHTML =
+    '<span class="sx-key-dot"></span>' +
+    '<span class="sx-key-main"><span class="sx-key-name"></span><span class="sx-key-id"></span></span>' +
+    '<span class="sx-plat' + (known ? ' ' + plat : '') + '"></span>' +
+    '<span class="sx-key-check">' + SVG_CHECK + '</span>';
+  row.querySelector('.sx-key-name').textContent = k.name;
+  row.querySelector('.sx-key-id').textContent = maskKey(k.key);
+  row.querySelector('.sx-plat').textContent = plat || '?';
+  row.addEventListener('click', () => {
+    if (!k.key) return;
+    setApiKey(k.key, k.name);
+    renderKeyList();
+    loadModels();
+  });
+  return row;
+}
+
+function makeManualRow(activeKey) {
+  const row = document.createElement('div');
+  row.className = 'sx-key is-manual selected';
+  row.innerHTML =
+    '<span class="sx-key-dot"></span>' +
+    '<span class="sx-key-main"><span class="sx-key-name">手动 Key</span><span class="sx-key-id"></span></span>' +
+    '<span class="sx-plat manual">' + SVG_PENCIL + '手动</span>' +
+    '<span class="sx-key-check">' + SVG_CHECK + '</span>';
+  row.querySelector('.sx-key-id').textContent = maskKey(activeKey);
+  return row;
+}
+
+// 当前生效的 key 永远显示为选中行；来源是手动粘贴（不在账户列表）时，顶部补一行“手动”。
 function renderKeyList() {
-  const zone = $('key-account-zone');
   const list = $('key-list');
-  if (!state.auth) { zone.classList.add('hidden'); return; }
-  zone.classList.remove('hidden');
+  if (!list) return;
+  const hint = $('key-hint');
+  const refreshBtn = $('btn-refresh-keys');
+  const loggedIn = !!state.auth;
+
+  // 仅 key 模式（未登录）：隐藏账户专属的“刷新”和提示
+  if (refreshBtn) refreshBtn.classList.toggle('hidden', !loggedIn);
+  if (hint) hint.classList.toggle('hidden', !loggedIn);
+
   list.innerHTML = '';
-  const keys = state.keysCache || [];
-  if (!keys.length) {
-    list.innerHTML = '<p class="modal-text">账户下没有可用的 key，去 sub2api 控制台创建一个。</p>';
-    return;
+  const keys = loggedIn ? (state.keysCache || []) : [];
+  const active = state.apiKey?.key || null;
+  const activeInList = !!active && keys.some((k) => k.key === active);
+
+  if (active && !activeInList) list.appendChild(makeManualRow(active));
+
+  if (loggedIn && !keys.length) {
+    const p = document.createElement('p');
+    p.className = 'sx-empty';
+    p.textContent = '账户下没有可用的 key，去 sub2api 控制台创建一个。';
+    list.appendChild(p);
   }
-  for (const k of keys) {
-    const row = document.createElement('div');
-    row.className = 'key-row' + (state.apiKey?.key === k.key ? ' selected' : '');
-    row.innerHTML = `
-      <span class="key-row-name"></span>
-      <span class="key-row-masked"></span>
-      <span class="key-row-platform${k.platform === 'openai' ? ' openai' : ''}"></span>`;
-    row.querySelector('.key-row-name').textContent = k.name;
-    row.querySelector('.key-row-masked').textContent = maskKey(k.key);
-    row.querySelector('.key-row-platform').textContent = k.platform || '?';
-    row.addEventListener('click', () => {
-      if (!k.key) return;
-      setApiKey(k.key, k.name);
-      renderKeyList();
-      loadModels();
-    });
-    list.appendChild(row);
+  for (const k of keys) list.appendChild(makeKeyRow(k, active));
+
+  if (!list.children.length) {
+    const p = document.createElement('p');
+    p.className = 'sx-empty';
+    p.textContent = '还没有设置 key —— 在下方粘贴一个开始。';
+    list.appendChild(p);
   }
 }
 
@@ -517,11 +558,13 @@ function openSettings() {
   renderKeyList();
   $('settings-mask').classList.remove('hidden');
 }
-$('btn-settings').addEventListener('click', openSettings);
 $('key-chip').addEventListener('click', openSettings);
-$('btn-close-settings').addEventListener('click', () => $('settings-mask').classList.add('hidden'));
+function closeSettings() { $('settings-mask').classList.add('hidden'); }
+$('btn-close-settings').addEventListener('click', closeSettings);
+$('btn-close-settings-x').addEventListener('click', closeSettings);
+$('btn-confirm-settings').addEventListener('click', closeSettings);
 $('settings-mask').addEventListener('click', (e) => {
-  if (e.target === $('settings-mask')) $('settings-mask').classList.add('hidden');
+  if (e.target === $('settings-mask')) closeSettings();
 });
 
 /* ───────────────────────── 模型 ───────────────────────── */
@@ -574,9 +617,9 @@ function syncComposerMode() {
   syncSizeOptions();
 }
 
-// 高分尺寸（2K/4K，自定义分辨率）只有文生图 /generations 支持；改图 /edits 接口上限 1536。
-// 因此带了参考图（改图模式）时禁用所有非预设档，只留三个原生预设，并把已选高分退回合法尺寸。
-const NATIVE_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536']);
+// 高分尺寸（自定义分辨率）只有文生图 /generations 支持；改图 /edits 接口只认 auto 和三个原生预设。
+// 因此带了参考图（改图模式）时禁用所有高分档，只留 auto + 三个原生预设，并把已选高分退回合法尺寸。
+const NATIVE_SIZES = new Set(['auto', '1024x1024', '1536x1024', '1024x1536']);
 function syncSizeOptions() {
   const sel = $('size-select');
   const editMode = state.attachments.length > 0;
