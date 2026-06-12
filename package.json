@@ -5,6 +5,11 @@
   "description": "Manifold 对话 + 生图 demo：静态前端 + 同源代理到 sub2api",
   "type": "commonjs",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
   }
 }
