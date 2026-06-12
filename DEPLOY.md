@@ -1,5 +1,29 @@
 # ManifoldNetwork chat-demo 服务器部署
 
+## ⚡ 升级部署 checklist（每次拉新代码先看这个）
+
+1. **拉代码 + 重建镜像**（关键是 `--build`，不加会继续用旧镜像）：
+   ```bash
+   cd /opt/manifold/chat-demo && git pull origin main
+   docker compose -f compose.edge.yml up -d --build
+   docker exec manifold-chat-demo ls /app    # 确认是新代码（server.ts 等 .ts 文件）
+   ```
+2. **浏览器 Ctrl+Shift+R 强刷**，拿到新前端（避免缓存旧 `app.js` 打老接口）。
+
+**含数据模型变更的版本（如 Phase 1）额外做**：
+
+3. **先备份**：DB（`VACUUM INTO`）+ **blobs 目录**（见文末「数据与备份」）。
+4. **跑迁移**：`docker exec manifold-chat-demo node migrate-phase1.ts`
+   —— 幂等、保留老数据可回退；**不跑则登录后看不到历史会话**（数据还在旧 `data` 列，迁移即回来）。
+5. **灰度稳定几天后再下线旧链路**（环境变量开关，可随时改回 `on` 回退）：
+   - `LEGACY_PROXY=off` → 下线旧 `/v1`、`/api/v1` 直打
+   - `LEGACY_STORE=off` → 下线旧 `/store`
+   - 验证：`curl -sS https://chat.zstuacm.xyz/v1/models` 与 `/store/conversations` 都应返回 404。
+
+> **两个最常踩的坑**：① 改了 compose 环境变量但忘了 `--build` → 容器还是旧代码、开关不生效；② 设了 `LEGACY_*=off` 但浏览器没强刷 → 旧前端还在打老接口、被 404 拦成「该端点已下线」。**先强刷确认新前端生效，再下线旧链路。**
+
+---
+
 chat-demo 是个**相对独立**的应用（静态前端 + 服务端推理/鉴权 + 会话存储 SQLite）。0b 起凭证活在服务端
 session（浏览器只持 httpOnly cookie），聊天/生图由后端用 session 里的 key 调上游。两种上线姿势：
 
