@@ -15,6 +15,28 @@ const IMAGE_MODEL_PREFIX = 'gpt-image';
 const FALLBACK_IMAGE_MODEL = 'gpt-image-2';
 const MAX_ATTACH = 4;
 const ATTACH_MAX_EDGE = 1568;
+const FILE_MAX_BYTES = 1024 * 1024;   // 单个文本文件上限 1MB（防上下文撑爆）
+// 文本类扩展名白名单（与后端 server.ts TEXT_EXT 保持一致）
+const TEXT_EXT = new Set([
+  'txt', 'md', 'markdown', 'csv', 'tsv', 'log', 'json', 'jsonl', 'ndjson',
+  'yaml', 'yml', 'xml', 'toml', 'ini', 'conf', 'env', 'sql', 'sh', 'bash', 'zsh',
+  'js', 'mjs', 'cjs', 'ts', 'jsx', 'tsx', 'vue', 'svelte', 'py', 'rb', 'php',
+  'java', 'kt', 'swift', 'go', 'rs', 'c', 'h', 'cpp', 'hpp', 'cc', 'cs', 'm',
+  'html', 'htm', 'css', 'scss', 'less', 'r', 'lua', 'pl', 'dart', 'gradle',
+]);
+function isTextLike(mime, name) {
+  const m = (mime || '').toLowerCase();
+  if (m.startsWith('text/')) return true;
+  if (m === 'application/json' || m === 'application/xml' || m === 'application/x-ndjson') return true;
+  if (/\+(json|xml)$/.test(m)) return true;
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return TEXT_EXT.has(ext);
+}
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(1) + ' MB';
+}
 
 /* ───────────────────────── 状态 ───────────────────────── */
 
@@ -165,12 +187,19 @@ function dataUrlToBlob(dataUrl) {
   return new Blob([arr], { type: mime });
 }
 
-// 把 dataURL 图片上传到 /api/blobs，返回内容寻址 hash（登录态用：base64 不再进会话 JSON）。
-async function uploadDataUrl(dataUrl) {
-  const blob = dataUrlToBlob(dataUrl);
-  const res = await fetch('/api/blobs', { method: 'POST', headers: { 'Content-Type': blob.type || 'image/png' }, body: blob });
-  if (!res.ok) { let m = '图片上传失败'; try { m = (await res.json())?.error?.message || m; } catch { /* 非 JSON */ } throw new Error(m); }
+// 把 Blob 上传到 /api/blobs，返回内容寻址 hash。
+async function uploadBlob(blob, fallbackMime) {
+  const res = await fetch('/api/blobs', { method: 'POST', headers: { 'Content-Type': blob.type || fallbackMime || 'application/octet-stream' }, body: blob });
+  if (!res.ok) { let m = '上传失败'; try { m = (await res.json())?.error?.message || m; } catch { /* 非 JSON */ } throw new Error(m); }
   return (await res.json()).hash;
+}
+// 把 dataURL 图片上传到 /api/blobs（登录态用：base64 不再进会话 JSON）。
+async function uploadDataUrl(dataUrl) {
+  return uploadBlob(dataUrlToBlob(dataUrl), 'image/png');
+}
+// 把文本文件内容上传到 /api/blobs（登录态用）。
+async function uploadText(text, mime) {
+  return uploadBlob(new Blob([text], { type: mime || 'text/plain' }), 'text/plain');
 }
 
 // 按需加载：把某会话 messages 从后端补全（本地模式或已加载则直接返回）
@@ -674,10 +703,26 @@ function buildEmptyState() {
   return div;
 }
 
-// 消息图片来源：登录态是 blobs:[hash]（→ /api/blobs/:hash）；keyonly 是 images:[dataUrl]。
-function msgImageUrls(m) {
-  if (m.blobs?.length) return m.blobs.map((h) => `/api/blobs/${encodeURIComponent(h)}`);
-  return m.images || [];
+// 归一化一条消息的附件 → [{kind:'image'|'file', name, url, mime}]。
+// 来源三态：① 登录态持久化 m.blobs=[{hash,name,mime,size}]（兼容旧裸 hash 字符串，按图片）；
+//           ② 本地乐观/keyonly m.atts=[{kind,name,mime,dataUrl?}]；③ 旧 IndexedDB m.images=[dataUrl]。
+function msgAttachments(m) {
+  if (m.blobs?.length) {
+    return m.blobs.map((b) => {
+      const hash = typeof b === 'string' ? b : b.hash;
+      const mime = typeof b === 'string' ? 'image/*' : (b.mime || '');
+      const url = `/api/blobs/${encodeURIComponent(hash)}`;
+      return mime.startsWith('image/') || mime === 'image/*'
+        ? { kind: 'image', name: (b.name || ''), url, mime }
+        : { kind: 'file', name: (b.name || hash), url, mime };
+    });
+  }
+  if (m.atts?.length) {
+    return m.atts.map((a) => a.kind === 'file'
+      ? { kind: 'file', name: a.name, url: a.url || '', mime: a.mime || 'text/plain' }
+      : { kind: 'image', name: a.name || '', url: a.dataUrl || a.url, mime: a.mime || 'image/png' });
+  }
+  return (m.images || []).map((u) => ({ kind: 'image', name: '', url: u, mime: 'image/png' }));
 }
 
 function buildMsgEl(m) {
@@ -687,8 +732,11 @@ function buildMsgEl(m) {
     const body = document.createElement('div');
     body.className = 'msg-body';
     body.textContent = m.text || '';
-    const uImgs = msgImageUrls(m);
-    if (uImgs.length) body.appendChild(buildImages(uImgs, false));
+    const atts = msgAttachments(m);
+    const imgs = atts.filter((a) => a.kind === 'image').map((a) => a.url);
+    const filz = atts.filter((a) => a.kind === 'file');
+    if (imgs.length) body.appendChild(buildImages(imgs, false));
+    if (filz.length) body.appendChild(buildFileChips(filz));
     div.appendChild(body);
   } else if (m.kind === 'error') {
     div.className = 'msg msg-error';
@@ -707,7 +755,7 @@ function buildMsgEl(m) {
     const body = document.createElement('div');
     body.className = 'msg-body md';
     body.innerHTML = mdRender(m.text || '');
-    const aImgs = msgImageUrls(m);
+    const aImgs = msgAttachments(m).filter((a) => a.kind === 'image').map((a) => a.url);
     if (aImgs.length) body.appendChild(buildImages(aImgs, true));
     div.appendChild(body);
   }
@@ -738,6 +786,21 @@ function buildImages(urls, downloadable) {
   return box;
 }
 
+// 消息里的文件附件卡片：有 url（登录态 blob）则可点击下载/查看；keyonly 无 url 仅显示文件名。
+function buildFileChips(files) {
+  const box = document.createElement('div');
+  box.className = 'msg-files';
+  files.forEach((f) => {
+    const el = document.createElement(f.url ? 'a' : 'div');
+    el.className = 'msg-file-chip';
+    if (f.url) { el.href = f.url; el.target = '_blank'; el.rel = 'noopener'; }
+    el.innerHTML = `<span class="msg-file-icon">📄</span><span class="msg-file-name"></span>`;
+    el.querySelector('.msg-file-name').textContent = f.name || '附件';
+    box.appendChild(el);
+  });
+  return box;
+}
+
 function openLightbox(url) {
   document.querySelector('.lightbox')?.remove();
   const box = document.createElement('div');
@@ -764,22 +827,41 @@ $('file-input').addEventListener('change', async (e) => {
   e.target.value = '';
 });
 
-// 统一入口：点选 / 粘贴 / 拖拽都走这里——只收图片、压缩、push、重渲染。返回实际加入张数。
+// 统一入口：点选 / 粘贴 / 拖拽都走这里——图片压缩、文本文件读文本，push、重渲染。返回实际加入数。
 async function addFiles(fileList) {
-  const files = Array.from(fileList || []).filter((f) => (f.type || '').startsWith('image/'));
+  const files = Array.from(fileList || []);
   let added = 0;
   for (const file of files) {
     if (state.attachments.length >= MAX_ATTACH) break;
+    const isImage = (file.type || '').startsWith('image/');
     try {
-      const dataUrl = await fileToDataUrl(file);
-      state.attachments.push({ dataUrl });
-      added++;
+      if (isImage) {
+        const dataUrl = await fileToDataUrl(file);
+        state.attachments.push({ kind: 'image', dataUrl, name: file.name || '', mime: file.type || 'image/png', size: file.size });
+        added++;
+      } else if (isTextLike(file.type, file.name || '')) {
+        if (file.size > FILE_MAX_BYTES) { alert(`文件「${file.name}」超过 ${fmtBytes(FILE_MAX_BYTES)}，暂不支持。`); continue; }
+        const text = await fileToText(file);
+        state.attachments.push({ kind: 'file', name: file.name || '未命名', mime: file.type || 'text/plain', size: file.size, text });
+        added++;
+      } else {
+        alert(`暂不支持该文件类型：${file.name || file.type || '未知'}（目前仅图片和纯文本类文件）`);
+      }
     } catch (err) {
-      alert(`读取图片失败：${err.message}`);
+      alert(`读取文件失败：${err.message}`);
     }
   }
   if (added) renderAttachments();
   return added;
+}
+
+function fileToText(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.onerror = () => reject(r.error || new Error('读取失败'));
+    r.readAsText(file);
+  });
 }
 
 async function fileToDataUrl(file) {
@@ -814,33 +896,42 @@ function renderAttachments() {
   box.classList.toggle('hidden', !state.attachments.length);
   state.attachments.forEach((att, idx) => {
     const chip = document.createElement('div');
-    chip.className = 'attach-chip';
-    const img = document.createElement('img');
-    img.src = att.dataUrl;
+    chip.className = 'attach-chip' + (att.kind === 'file' ? ' attach-file' : '');
+    if (att.kind === 'file') {
+      const info = document.createElement('div');
+      info.className = 'attach-file-info';
+      info.innerHTML = `<span class="attach-file-icon">📄</span><span class="attach-file-meta"><span class="attach-file-name"></span><span class="attach-file-size"></span></span>`;
+      info.querySelector('.attach-file-name').textContent = att.name;
+      info.querySelector('.attach-file-size').textContent = fmtBytes(att.size || (att.text || '').length);
+      chip.appendChild(info);
+    } else {
+      const img = document.createElement('img');
+      img.src = att.dataUrl;
+      chip.appendChild(img);
+    }
     const del = document.createElement('button');
     del.textContent = '×';
     del.addEventListener('click', () => {
       state.attachments.splice(idx, 1);
       renderAttachments();
     });
-    chip.appendChild(img);
     chip.appendChild(del);
     box.appendChild(chip);
   });
   syncSizeOptions();
 }
 
-// Ctrl/⌘+V 粘贴图片：剪贴板含图片文件才介入，纯文本粘贴照常进输入框。
+// Ctrl/⌘+V 粘贴：剪贴板含图片/文本文件才介入，纯文本粘贴照常进输入框。
 document.addEventListener('paste', (e) => {
   if ($('view-app').classList.contains('hidden')) return;
   const items = e.clipboardData?.items;
   if (!items) return;
   const files = [];
   for (const it of items) {
-    if (it.kind === 'file' && (it.type || '').startsWith('image/')) {
-      const f = it.getAsFile();
-      if (f) files.push(f);
-    }
+    if (it.kind !== 'file') continue;            // kind==='string' 是纯文本，留给输入框
+    const f = it.getAsFile();
+    if (!f) continue;
+    if ((it.type || '').startsWith('image/') || isTextLike(f.type, f.name || '')) files.push(f);
   }
   if (!files.length) return;
   e.preventDefault();
@@ -923,8 +1014,9 @@ function setSending(on) {
 }
 
 function pushUserMessage(conv, text) {
-  const images = state.attachments.map((a) => a.dataUrl);
-  const msg = { role: 'user', text, images, kind: 'chat' };
+  // atts 归一化保存：图片留 dataUrl、文本文件留 text，供乐观渲染与 keyonly 本地持久化。
+  const atts = state.attachments.map((a) => ({ ...a }));
+  const msg = { role: 'user', text, atts, kind: 'chat' };
   conv.messages.push(msg);
   if (conv.title === '新对话' && text) conv.title = text.slice(0, 24);
   state.attachments = [];
@@ -947,16 +1039,22 @@ function pushErrorMessage(conv, text) {
 }
 
 /* —— 聊天（含识图） —— */
-// 系统提示已移到后端注入（前端不再拼），这里只传对话历史。
+// keyonly 用：前端拼上下文（无后端落库）。系统提示由后端注入，这里只传历史。
+// 图片走 image_url（dataUrl）；文本文件内联进 text part（与后端 buildUpstreamMessages 注入格式一致）。
 function buildApiMessages(conv) {
   const out = [];
   for (const m of conv.messages) {
     if (m.kind === 'error') continue;
     if (m.role === 'user') {
-      if (m.images?.length) {
+      // 兼容旧 IndexedDB 数据：老消息用 m.images:[dataUrl]，新消息用 m.atts。
+      const atts = m.atts || (m.images || []).map((u) => ({ kind: 'image', dataUrl: u }));
+      const imgs = atts.filter((a) => a.kind === 'image');
+      const files = atts.filter((a) => a.kind === 'file');
+      if (imgs.length || files.length) {
         const parts = [];
         if (m.text) parts.push({ type: 'text', text: m.text });
-        for (const u of m.images) parts.push({ type: 'image_url', image_url: { url: u } });
+        for (const f of files) parts.push({ type: 'text', text: `\n[附件文件: ${f.name || '未命名'}]\n\`\`\`\n${f.text || ''}\n\`\`\`\n` });
+        for (const a of imgs) parts.push({ type: 'image_url', image_url: { url: a.dataUrl || a.url } });
         out.push({ role: 'user', content: parts });
       } else {
         out.push({ role: 'user', content: m.text || '' });
@@ -972,7 +1070,7 @@ async function sendChat(text) {
   const conv = currentConv() || newConv();
   await ensureMessages(conv);
   const model = currentModel();
-  const imgs = state.attachments.map((a) => a.dataUrl);  // 发送前取（pushUserMessage 会清空 attachments）
+  const atts = state.attachments.slice();  // 发送前取（pushUserMessage 会清空 attachments）
   pushUserMessage(conv, text);
   await persistConv(conv);
 
@@ -1000,12 +1098,14 @@ async function sendChat(text) {
   try {
     let res;
     if (useServer()) {
-      // 登录态：图片先传 /api/blobs 拿 hash，后端落库 + 组装上下文（发 {text, attachments:[hash]}）
-      let hashes = [];
-      if (imgs.length) hashes = await Promise.all(imgs.map(uploadDataUrl));
+      // 登录态：附件先传 /api/blobs 拿 hash，后端落库 + 组装上下文（发 {text, attachments:[{hash,name}]}）
+      const attachments = await Promise.all(atts.map(async (a) => ({
+        hash: a.kind === 'file' ? await uploadText(a.text, a.mime) : await uploadDataUrl(a.dataUrl),
+        name: a.name || '',
+      })));
       res = await fetch(`/api/conversations/${encodeURIComponent(conv.id)}/messages`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ model, text, attachments: hashes }), signal: ctrl.signal,
+        body: JSON.stringify({ model, text, attachments }), signal: ctrl.signal,
       });
     } else {
       // keyonly：前端拼上下文（不落后端库）
@@ -1154,7 +1254,8 @@ async function sendImageGen(prompt) {
   let size = $('size-select').value;
   const quality = $('quality-select').value;
   const userMsg = pushUserMessage(conv, prompt);
-  const refImages = userMsg.images || []; // 附了参考图 → 后端走 edits 改图
+  // 生图只取图片附件作参考图（文本文件忽略）；附了参考图 → 后端走 edits 改图。
+  const refImages = (userMsg.atts || []).filter((a) => a.kind === 'image').map((a) => a.dataUrl);
   if (refImages.length && !NATIVE_SIZES.has(size)) size = '1024x1024';
   await persistConv(conv);
 
