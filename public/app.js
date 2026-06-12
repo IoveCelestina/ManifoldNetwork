@@ -574,15 +574,14 @@ function syncComposerMode() {
   syncSizeOptions();
 }
 
-// 2K(2048×2048) 只有文生图 /generations 支持；改图 /edits 接口上限 1536。
-// 因此一旦带了参考图（改图模式）就禁用 2K，并把已选中的 2K 退回到合法尺寸。
+// 高分尺寸（2K/4K，自定义分辨率）只有文生图 /generations 支持；改图 /edits 接口上限 1536。
+// 因此带了参考图（改图模式）时禁用所有非预设档，只留三个原生预设，并把已选高分退回合法尺寸。
+const NATIVE_SIZES = new Set(['1024x1024', '1536x1024', '1024x1536']);
 function syncSizeOptions() {
   const sel = $('size-select');
-  const big = sel.querySelector('option[value="2048x2048"]');
-  if (!big) return;
   const editMode = state.attachments.length > 0;
-  big.disabled = editMode;
-  if (editMode && sel.value === '2048x2048') sel.value = '1024x1024';
+  for (const opt of sel.options) opt.disabled = editMode && !NATIVE_SIZES.has(opt.value);
+  if (editMode && !NATIVE_SIZES.has(sel.value)) sel.value = '1024x1024';
 }
 
 /* ───────────────────────── 会话 ───────────────────────── */
@@ -1158,7 +1157,7 @@ async function sendImageGen(prompt) {
   const quality = $('quality-select').value;
   const userMsg = pushUserMessage(conv, prompt);
   const refImages = userMsg.images || []; // 附了参考图 → 走 edits 按图改图
-  if (refImages.length && size === '2048x2048') size = '1024x1024'; // edits 接口不支持 2K，退回合法尺寸
+  if (refImages.length && !NATIVE_SIZES.has(size)) size = '1024x1024'; // edits 不支持高分自定义尺寸，退回合法尺寸
   await persistConv(conv);
 
   // 等待画面：脉冲环 + 计时器
