@@ -327,7 +327,10 @@ const stmtMbIns: Stmt = db.prepare('INSERT OR IGNORE INTO message_blobs (message
 const stmtMbByMsg: Stmt = db.prepare('SELECT mb.blob_hash AS hash, mb.name, b.mime, b.size FROM message_blobs mb JOIN blobs b ON b.hash = mb.blob_hash WHERE mb.message_id = ? ORDER BY mb.ord');
 const stmtMbDelByConv: Stmt = db.prepare('DELETE FROM message_blobs WHERE message_id IN (SELECT id FROM messages WHERE conv_id = ? AND uid = ?)');
 const stmtBlobOwn: Stmt = db.prepare('SELECT 1 FROM messages m JOIN message_blobs mb ON m.id = mb.message_id WHERE m.uid = ? AND mb.blob_hash = ? LIMIT 1');
-const stmtBlobOrphans: Stmt = db.prepare('SELECT hash FROM blobs WHERE hash NOT IN (SELECT DISTINCT blob_hash FROM message_blobs)');
+// 孤儿 blob：无任何 message_blobs 引用。带 created_at 宽限过滤——刚上传但还没挂到消息上的 blob
+// （前端「先传 blob 拿 hash → 再发消息挂载」之间的窗口）不能被 GC 误删。
+const stmtBlobOrphans: Stmt = db.prepare('SELECT hash FROM blobs WHERE created_at < ? AND hash NOT IN (SELECT DISTINCT blob_hash FROM message_blobs)');
+const stmtBlobDel: Stmt = db.prepare('DELETE FROM blobs WHERE hash = ?');
 
 function listConvs(uid: number): ConvMetaRow[] {
   return stmtConvList2.all(uid).map((r: any) => ({ id: r.id, title: r.title, createdAt: r.created_at, updatedAt: r.updated_at }));
@@ -389,9 +392,13 @@ function linkBlob(messageId: string, hash: string, ord: number, name = ''): void
 function userOwnsBlob(uid: number, hash: string): boolean {
   return !!stmtBlobOwn.get(uid, hash);
 }
-// 无任何 message_blobs 引用的孤儿 blob（GC 用）
-function orphanBlobs(): string[] {
-  return stmtBlobOrphans.all().map((r: any) => r.hash);
+// 孤儿 blob 的 hash 列表（GC 用）。只返回 created_at < beforeMs 的，给新上传留宽限期。
+function orphanBlobs(beforeMs: number = Number.MAX_SAFE_INTEGER): string[] {
+  return stmtBlobOrphans.all(beforeMs).map((r: any) => r.hash);
+}
+// 删 blob 元数据行（文件由调用方删）。
+function deleteBlob(hash: string): void {
+  stmtBlobDel.run(hash);
 }
 
 // 迁移用：列出所有会话（含 data 列），供 migrate-phase1.ts 把老 JSON-blob 拆进新表。
@@ -410,5 +417,5 @@ module.exports = {
   // Phase 1：会话/消息/blob 数据访问层
   listConvs, getConvMeta, createConv, renameConv, touchConv, deleteConv, convHasMessages,
   nextSeq, insertMessage, getMessages,
-  insertBlob, getBlobMeta, linkBlob, userOwnsBlob, orphanBlobs, listConvsForMigration,
+  insertBlob, getBlobMeta, linkBlob, userOwnsBlob, orphanBlobs, deleteBlob, listConvsForMigration,
 };
