@@ -26,6 +26,15 @@ const BASE: string = (process.env.SUB2API_BASE || 'https://zstuacm.xyz').replace
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
+// 静态资源版本号 = app.js/style.css 内容哈希。部署后内容变 → index.html 引用的 ?v= 变 →
+// 浏览器/CF 强制取新版前端，免手动 Purge（CF 对 .js/.css 的边缘缓存常导致部署后仍跑旧前端）。
+let ASSET_VER = '0';
+try {
+  const h = crypto.createHash('sha256');
+  for (const f of ['app.js', 'style.css']) h.update(fs.readFileSync(path.join(PUBLIC_DIR, f)));
+  ASSET_VER = h.digest('hex').slice(0, 10);
+} catch { /* 文件缺失则用默认值 */ }
+
 // 旧的浏览器直打代理（/api/v1/* 与 /v1/*）。前端 0b 起已全改走 /api/*，不再用它。
 // 迁移期默认保留作回退；生产灰度确认新链路无误后，设 LEGACY_PROXY=off 即下线（无需改代码、可随时回退）。
 const LEGACY_PROXY = (process.env.LEGACY_PROXY || 'on').toLowerCase() !== 'off';
@@ -1349,12 +1358,15 @@ function serveStatic(req: IncomingMessage, res: ServerResponse): void {
       'Cache-Control': 'no-cache',
       ...SECURITY_HEADERS,
     };
+    let body = data;
     if (ext === '.html') {
       headers['Content-Security-Policy'] = CSP;
       headers['X-Frame-Options'] = 'DENY';
+      // 给本地 app.js/style.css 引用注入版本号，部署后强制取新版（绕开 CF/浏览器对 .js/.css 的缓存）
+      body = Buffer.from(data.toString('utf8').replace(/(\/(?:app\.js|style\.css))(["'])/g, `$1?v=${ASSET_VER}$2`), 'utf8');
     }
     res.writeHead(200, headers);
-    res.end(data);
+    res.end(body);
   });
 }
 

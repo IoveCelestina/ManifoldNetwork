@@ -245,11 +245,29 @@ async function reconnectInflight(conv) {
   state.streaming = ctrl;                 // 复用流式态：停止按钮可中止订阅（生成仍在后台跑完落库）
   setSending(true);
 
+  // 立刻渲染在途占位（不等 /stream 返回），消除「刷新回来只有提问、没有任何提示」的空窗
+  let aMsg = null, aBody = null;
+  let pendingEl;
+  if (kind === 'image') {
+    pendingEl = document.createElement('div');
+    pendingEl.className = 'msg msg-assistant is-image';
+    pendingEl.innerHTML = `
+      <div class="msg-role"><span class="msg-role-glyph">✦</span><span class="msg-role-name">续接生成中…</span></div>
+      <div class="msg-body"><div class="gen-pending"><div class="gen-rings"><span></span><span></span><span></span></div><div class="gen-pending-text">接上后台生成…</div></div></div>`;
+  } else {
+    aMsg = { role: 'assistant', text: '', kind: 'chat' };
+    pendingEl = buildMsgEl(aMsg);
+    aBody = pendingEl.querySelector('.msg-body');
+    aBody.innerHTML = '<span class="stream-caret"></span>';
+  }
+  $('messages').appendChild(pendingEl);
+  scrollToBottom(true);
+
   const finish = async () => {
     setSending(false);                    // 内部已置 state.streaming = null
     conv.messages = null;
     await ensureMessages(conv);           // 后端已落库 → 重拉同步
-    if (state.currentId === conv.id) renderMessages();
+    if (state.currentId === conv.id) renderMessages();   // 会清掉临时占位、按 DB 规范状态重渲染
   };
 
   let res;
@@ -258,32 +276,19 @@ async function reconnectInflight(conv) {
   } catch { await finish(); return; }
   if (res.status === 204 || !res.ok || !res.body) { await finish(); return; }  // 已无在途任务 → 直接同步
 
-  if (kind === 'image') {
-    const pendingEl = document.createElement('div');
-    pendingEl.className = 'msg msg-assistant is-image';
-    pendingEl.innerHTML = `
-      <div class="msg-role"><span class="msg-role-glyph">✦</span><span class="msg-role-name">续接生成中…</span></div>
-      <div class="msg-body"><div class="gen-pending"><div class="gen-rings"><span></span><span></span><span></span></div><div class="gen-pending-text">接上后台生成…</div></div></div>`;
-    $('messages').appendChild(pendingEl);
-    scrollToBottom(true);
-    try { await readImageSse(res, pendingEl); } catch { /* 出错由下方 DB 同步纠正 */ }
-  } else {
-    const aMsg = { role: 'assistant', text: '', kind: 'chat' };
-    const aEl = buildMsgEl(aMsg);
-    const aBody = aEl.querySelector('.msg-body');
-    aBody.innerHTML = '<span class="stream-caret"></span>';
-    $('messages').appendChild(aEl);
-    scrollToBottom(true);
-    let last = 0;
-    try {
+  try {
+    if (kind === 'image') {
+      await readImageSse(res, pendingEl);
+    } else {
+      let last = 0;
       await pumpChatSse(res, (d) => {
         aMsg.text += d;
         const now = Date.now();
         if (now - last > 90) { last = now; aBody.innerHTML = mdRender(aMsg.text) + '<span class="stream-caret"></span>'; scrollToBottom(false); }
       });
-    } catch { /* 出错/中止由下方 DB 同步纠正 */ }
-  }
-  await finish();   // renderMessages 会清空临时气泡、按 DB 规范状态重渲染
+    }
+  } catch { /* 出错/中止由下方 DB 同步纠正 */ }
+  await finish();
 }
 
 // 统一加载会话列表（按 useServer 选后端/本地），并设好 currentId
