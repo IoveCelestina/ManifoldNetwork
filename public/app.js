@@ -473,14 +473,18 @@ $('btn-use-key').addEventListener('click', async () => {
 });
 
 function renderKeyChip() {
+  const label = state.me?.key ? (state.me.key.label || state.me.key.masked || 'Key') : '未设置 Key';
+  const hasKey = !!state.me?.key;
   const chip = $('key-chip');
-  if (!chip) return;
-  if (state.me?.key) {
-    chip.textContent = state.me.key.label || state.me.key.masked || 'Key';
-    chip.classList.remove('unset');
-  } else {
-    chip.textContent = '未设置 Key';
-    chip.classList.add('unset');
+  if (chip) {
+    chip.textContent = label;
+    chip.classList.toggle('unset', !hasKey);
+  }
+  // 移动端：抽屉底部 Key 入口同步（顶栏 key-chip 在窄屏已收起）
+  const keyLabel = $('me-key-label');
+  if (keyLabel) {
+    keyLabel.textContent = label;
+    $('me-key')?.classList.toggle('unset', !hasKey);
   }
 }
 
@@ -552,6 +556,51 @@ function syncComposerMode() {
     ? '生图模式 · 直接描述 = 文生图 · 附图 = 按参考图改图'
     : 'Enter 发送 · Shift+Enter 换行';
   syncSizeOptions();
+  syncModelPill();          // 移动端顶栏药丸跟随当前模型
+}
+
+/* ── 移动端：顶栏模型药丸 + 底部模型选择弹层（桌面用 header 的 select，不触发弹层）── */
+function syncModelPill() {
+  const el = $('model-pill-name');
+  if (el) el.textContent = currentModel() || '模型';
+  $('model-pill')?.classList.toggle('is-image', isImageMode());
+}
+
+function renderModelSheet() {
+  const list = $('model-sheet-list');
+  if (!list) return;
+  const sel = $('model-select');
+  const cur = sel.value;
+  list.innerHTML = '';
+  for (const opt of sel.options) {
+    const id = opt.value;
+    const isImg = id.startsWith(IMAGE_MODEL_PREFIX);
+    const btn = document.createElement('button');
+    btn.className = 'sheet-mdl ' + (isImg ? 'is-image' : 'is-chat') + (id === cur ? ' sel' : '');
+    btn.innerHTML =
+      '<span class="sheet-mdl-dot"></span>' +
+      '<span class="sheet-mdl-name"></span>' +
+      '<span class="sheet-mdl-check"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>';
+    btn.querySelector('.sheet-mdl-name').textContent = id;
+    btn.addEventListener('click', () => {
+      if (sel.value !== id) {
+        sel.value = id;
+        sel.dispatchEvent(new Event('change'));   // 复用现有逻辑：存偏好 + syncComposerMode（含刷新药丸）
+      }
+      closeModelSheet();
+    });
+    list.appendChild(btn);
+  }
+}
+
+function openModelSheet() {
+  renderModelSheet();
+  $('model-sheet').classList.add('open');
+  $('model-sheet-scrim').classList.add('open');
+}
+function closeModelSheet() {
+  $('model-sheet').classList.remove('open');
+  $('model-sheet-scrim').classList.remove('open');
 }
 
 // 高分尺寸只有文生图 /generations 支持；改图 /edits 只认 auto 和三个原生预设。
@@ -662,8 +711,12 @@ $('btn-new-mobile').addEventListener('click', () => {
   newConv();            // newConv 内已收起抽屉
   $('input-box').focus();
 });
+// 移动端：顶栏药丸开模型弹层、抽屉底部 Key 入口开设置
+$('model-pill').addEventListener('click', openModelSheet);
+$('model-sheet-scrim').addEventListener('click', closeModelSheet);
+$('me-key').addEventListener('click', () => { closeDrawer(); openSettings(); });
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeDrawer();
+  if (e.key === 'Escape') { closeDrawer(); closeModelSheet(); }
 });
 
 /* ───────────────────────── 消息渲染 ───────────────────────── */

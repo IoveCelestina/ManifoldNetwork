@@ -92,6 +92,12 @@
         <span class="me-label" id="me-label">未登录</span>
         <button class="btn btn-ghost btn-small btn-logout" id="btn-logout">退出</button>
       </div>
+      <!-- 移动端：Key/设置入口收进抽屉（桌面用顶栏 key-chip，隐藏此项） -->
+      <button class="me-key" id="me-key" title="点击管理 Key">
+        <span class="me-key-dot"></span>
+        <span class="me-key-label" id="me-key-label">未设置 Key</span>
+        <svg class="me-key-gear" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      </button>
     </div>
   </aside>
 
@@ -101,16 +107,22 @@
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
       </button>
       <div class="header-title" id="header-title">新对话</div>
+      <!-- 移动端：居中模型药丸，点开底部弹层选模型（桌面隐藏，用右侧 header-controls 的 select） -->
+      <button class="model-pill hdr-modelpill" id="model-pill" aria-label="切换模型">
+        <span class="mn" id="model-pill-name">模型</span>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+      </button>
       <div class="header-controls">
         <label class="model-pick">
           <span class="model-pick-label">模型</span>
           <select id="model-select"></select>
         </label>
         <button class="key-chip mono" id="key-chip" title="点击更换 Key">未设置 Key</button>
-        <button class="btn-icon hdr-newchat" id="btn-new-mobile" aria-label="新对话">
-          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
-        </button>
       </div>
+      <!-- 移动端：右上角新建（桌面隐藏） -->
+      <button class="btn-icon hdr-newchat" id="btn-new-mobile" aria-label="新对话">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+      </button>
     </header>
 
     <div class="messages-scroll" id="messages-scroll">
@@ -134,30 +146,31 @@
     <div class="composer-zone">
       <div class="composer" id="composer">
         <div class="attach-previews hidden" id="attach-previews"></div>
+        <!-- 生图参数：独立成行，置于输入行上方，不再与输入框/发送挤一行 -->
+        <div class="imagegen-controls hidden" id="imagegen-controls">
+          <select id="size-select" title="生成尺寸">
+            <option value="auto">auto</option>
+            <option value="1024x1024" selected>1024×1024</option>
+            <option value="1536x1024">1536×1024</option>
+            <option value="1024x1536">1024×1536</option>
+            <option value="2048x2048">2048×2048</option>
+            <option value="2048x1152">2048×1152</option>
+            <option value="3840x2160">3840×2160</option>
+            <option value="2160x3840">2160×3840</option>
+          </select>
+          <select id="quality-select" title="质量档位：低档更快更省">
+            <option value="auto">质量·auto</option>
+            <option value="low">质量·低</option>
+            <option value="medium">质量·中</option>
+            <option value="high">质量·高</option>
+          </select>
+        </div>
         <div class="composer-row">
           <button class="btn-icon" id="btn-attach" title="上传图片（识图）">
             <svg viewBox="0 0 24 24" width="20" height="20"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z M4 15l4.5-4.5L13 15m2-2 2-2 3 3"/><circle cx="9.5" cy="9.5" r="1.4" fill="currentColor"/></svg>
           </button>
           <input type="file" id="file-input" accept="image/*,.txt,.md,.markdown,.csv,.tsv,.log,.json,.jsonl,.yaml,.yml,.xml,.toml,.ini,.sql,.sh,.js,.mjs,.cjs,.ts,.jsx,.tsx,.vue,.py,.rb,.php,.java,.kt,.swift,.go,.rs,.c,.h,.cpp,.hpp,.cc,.cs,.html,.htm,.css,.scss,.less,text/*" multiple class="hidden">
           <textarea id="input-box" rows="1" placeholder="输入消息…"></textarea>
-          <div class="imagegen-controls hidden" id="imagegen-controls">
-            <select id="size-select" title="生成尺寸">
-              <option value="auto">auto</option>
-              <option value="1024x1024" selected>1024×1024</option>
-              <option value="1536x1024">1536×1024</option>
-              <option value="1024x1536">1024×1536</option>
-              <option value="2048x2048">2048×2048</option>
-              <option value="2048x1152">2048×1152</option>
-              <option value="3840x2160">3840×2160</option>
-              <option value="2160x3840">2160×3840</option>
-            </select>
-            <select id="quality-select" title="质量档位：低档更快更省">
-              <option value="auto">质量·auto</option>
-              <option value="low">质量·低</option>
-              <option value="medium">质量·中</option>
-              <option value="high">质量·高</option>
-            </select>
-          </div>
           <button class="btn btn-send" id="btn-send">发送</button>
         </div>
         <div class="composer-hint" id="composer-hint">Enter 发送 · Shift+Enter 换行</div>
@@ -167,6 +180,14 @@
 
   <!-- 移动端抽屉背板遮罩（点击收起侧栏，桌面隐藏） -->
   <div class="sidebar-scrim" id="sidebar-scrim"></div>
+
+  <!-- 移动端：底部模型选择弹层（桌面用顶栏 select，不触发此弹层） -->
+  <div class="model-sheet-scrim" id="model-sheet-scrim"></div>
+  <div class="model-sheet" id="model-sheet" role="dialog" aria-label="选择模型">
+    <div class="sheet-grip"></div>
+    <div class="sheet-title">选择模型</div>
+    <div class="sheet-list" id="model-sheet-list"></div>
+  </div>
 
   <!-- 设置弹层 -->
   <div class="modal-mask hidden" id="settings-mask">
