@@ -132,7 +132,7 @@
           <button class="btn-icon" id="btn-attach" title="上传图片（识图）">
             <svg viewBox="0 0 24 24" width="20" height="20"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" d="M4 17V7a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2Z M4 15l4.5-4.5L13 15m2-2 2-2 3 3"/><circle cx="9.5" cy="9.5" r="1.4" fill="currentColor"/></svg>
           </button>
-          <input type="file" id="file-input" accept="image/*" multiple class="hidden">
+          <input type="file" id="file-input" accept="image/*,.txt,.md,.markdown,.csv,.tsv,.log,.json,.jsonl,.yaml,.yml,.xml,.toml,.ini,.sql,.sh,.js,.mjs,.cjs,.ts,.jsx,.tsx,.vue,.py,.rb,.php,.java,.kt,.swift,.go,.rs,.c,.h,.cpp,.hpp,.cc,.cs,.html,.htm,.css,.scss,.less,text/*" multiple class="hidden">
           <textarea id="input-box" rows="1" placeholder="输入消息…"></textarea>
           <div class="imagegen-controls hidden" id="imagegen-controls">
             <select id="size-select" title="生成尺寸">
@@ -233,8 +233,8 @@
         <path d="M12 16V4m0 0L7 9m5-5 5 5"/>
         <path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
       </svg>
-      <p>松开以添加图片</p>
-      <span>用于识图 · 最多 4 张</span>
+      <p>松开以添加附件</p>
+      <span>图片用于识图 · 文本文件抽内容进上下文 · 最多 4 个</span>
     </div>
   </div>
 

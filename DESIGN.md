@@ -1,7 +1,7 @@
 # ManifoldNetwork 架构蓝图 · 从「套壳」到「真前后端」
 
 > 本文是**施工蓝图**。**Phase 0 已落地并上线**（main，2026-06）：推理与凭证搬到服务端、浏览器只持 httpOnly cookie、后端 TS 化、旧 `/v1` 直打已下线（`LEGACY_PROXY=off`）。
-> 现状仍是**单 JSON-blob 会话库**（base64 图内联、每轮重写整段）——这正是 **Phase 1** 要拆的（见 §7、§10）。后续按文末「分阶段」推进，每阶段可独立停下。
+> **Phase 1（拆数据模型：messages/blobs 表 + 图片内容寻址）、Phase 2（纯文本类文件附件抽文本进上下文）已实现，在各自 feature 分支待部署**（见 §10）。后续按文末「分阶段」推进，每阶段可独立停下。
 
 ## 0. 范围与已定决策
 
@@ -223,7 +223,10 @@ for 每个旧 conversations 行:
   - 建 `conversations/messages/blobs/message_blobs`，加 `/api/blobs`。
   - 跑 §7 迁移；图片改 `<img src="/api/blobs/:hash">`，base64 不再进 JSON。
   - 治掉「每轮重写整段」与存储膨胀。
-- **Phase 2 ｜ 文件处理（可缓）**
-  - 前端/后端抽文本进上下文（txt/代码/csv/json → PDF→pdf.js → Office）。
-  - RAG/向量库：仅当确有「与长文档对话」需求时再评估，非默认。
+- **Phase 2 ｜ 文件处理** ✅ **已实现**（branch `feat/phase-2-file-handling`，待部署）
+  - **本轮仅纯文本类**（txt / md / csv / json / 各种源代码 / log / yaml / xml…）：后端按 UTF-8 直读注入上下文，**零依赖、零构建**。
+  - 实现：`message_blobs` 加 `name` 列（同 hash 可不同名）；`server.ts` 加 `isTextLike` / `FILE_TEXT_MAX`，`buildUpstreamMessages` 对文本类 blob 读文本、截断、注入 `[附件文件: x]` 代码围栏；attachments 线格式 `[hash]`→`[{hash,name}]`（兼容旧裸 hash）。
+  - 前端：`addFiles` 分流图片/文本文件，文件 chip（输入预览 + 消息气泡可下载），登录态文件走 blob 内容寻址、keyonly 前端读文本内联。
+  - **无破坏性 schema 变更**（`ALTER ADD COLUMN` 幂等 + 默认值兼容旧数据），部署 `--build` 重启即可，无需迁移脚本。
+  - **后续（未做）**：PDF→pdf.js → Office；RAG/向量库仅当确有「与长文档对话」需求时再评估，非默认。
 ```

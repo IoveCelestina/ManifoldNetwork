@@ -643,6 +643,40 @@ input:focus, textarea:focus, select:focus {
 }
 .attach-chip button:hover { color: var(--danger); border-color: var(--danger); }
 
+/* 文本文件附件 chip（输入区预览） */
+.attach-chip.attach-file { min-width: 0; }
+.attach-file-info {
+  display: flex; align-items: center; gap: 8px;
+  max-width: 220px; height: 62px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline-strong);
+  background: var(--ink-0);
+}
+.attach-file-icon { font-size: 20px; line-height: 1; flex: none; }
+.attach-file-meta { display: flex; flex-direction: column; min-width: 0; }
+.attach-file-name {
+  font-size: 12.5px; color: var(--text-1);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.attach-file-size { font-size: 11px; color: var(--text-2); }
+
+/* 消息气泡里的文件附件卡片 */
+.msg-files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.msg-file-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  max-width: 240px;
+  padding: 7px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--hairline-strong);
+  background: var(--ink-0);
+  color: var(--text-1);
+  font-size: 12.5px; text-decoration: none;
+}
+a.msg-file-chip:hover { border-color: var(--phos-dim); color: var(--phos); }
+.msg-file-icon { font-size: 16px; line-height: 1; flex: none; }
+.msg-file-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
 /* ─────────────── 设置弹层 ─────────────── */
 .modal-mask {
   position: fixed; inset: 0;

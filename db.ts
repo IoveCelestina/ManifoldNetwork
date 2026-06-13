@@ -287,15 +287,19 @@ db.exec(`
     message_id TEXT    NOT NULL,
     blob_hash  TEXT    NOT NULL,
     ord        INTEGER NOT NULL DEFAULT 0,
+    name       TEXT    NOT NULL DEFAULT '',
     PRIMARY KEY (message_id, blob_hash)
   );
 `);
 db.exec('CREATE INDEX IF NOT EXISTS idx_mb_hash ON message_blobs(blob_hash)');
+// Phase 2：已存在的库补 name 列（文件名按「消息↔blob 链接」存，同 hash 可不同名）。重复跑报 duplicate column，忽略。
+try { db.exec("ALTER TABLE message_blobs ADD COLUMN name TEXT NOT NULL DEFAULT ''"); } catch { /* 列已存在 */ }
 
 interface ConvMetaRow { id: string; title: string; createdAt: number; updatedAt: number; }
+interface BlobRef { hash: string; name: string; mime: string; size: number; }
 interface MessageOut {
   id: string; role: string; kind: string; model: string | null;
-  text: string; seq: number; createdAt: number; blobs: string[];
+  text: string; seq: number; createdAt: number; blobs: BlobRef[];
 }
 interface InsertMessageInput {
   id: string; convId: string; uid: number; seq: number;
@@ -319,8 +323,8 @@ const stmtMsgHasConv: Stmt = db.prepare('SELECT 1 FROM messages WHERE conv_id = 
 // blob
 const stmtBlobIns: Stmt = db.prepare('INSERT OR IGNORE INTO blobs (hash, mime, size, created_at) VALUES (?, ?, ?, ?)');
 const stmtBlobGet: Stmt = db.prepare('SELECT hash, mime, size FROM blobs WHERE hash = ?');
-const stmtMbIns: Stmt = db.prepare('INSERT OR IGNORE INTO message_blobs (message_id, blob_hash, ord) VALUES (?, ?, ?)');
-const stmtMbByMsg: Stmt = db.prepare('SELECT blob_hash FROM message_blobs WHERE message_id = ? ORDER BY ord');
+const stmtMbIns: Stmt = db.prepare('INSERT OR IGNORE INTO message_blobs (message_id, blob_hash, ord, name) VALUES (?, ?, ?, ?)');
+const stmtMbByMsg: Stmt = db.prepare('SELECT mb.blob_hash AS hash, mb.name, b.mime, b.size FROM message_blobs mb JOIN blobs b ON b.hash = mb.blob_hash WHERE mb.message_id = ? ORDER BY mb.ord');
 const stmtMbDelByConv: Stmt = db.prepare('DELETE FROM message_blobs WHERE message_id IN (SELECT id FROM messages WHERE conv_id = ? AND uid = ?)');
 const stmtBlobOwn: Stmt = db.prepare('SELECT 1 FROM messages m JOIN message_blobs mb ON m.id = mb.message_id WHERE m.uid = ? AND mb.blob_hash = ? LIMIT 1');
 const stmtBlobOrphans: Stmt = db.prepare('SELECT hash FROM blobs WHERE hash NOT IN (SELECT DISTINCT blob_hash FROM message_blobs)');
@@ -367,7 +371,7 @@ function insertMessage(m: InsertMessageInput): void {
 function getMessages(convId: string, uid: number): MessageOut[] {
   return stmtMsgList.all(convId, uid).map((r: any) => ({
     id: r.id, role: r.role, kind: r.kind, model: r.model, text: r.text, seq: r.seq, createdAt: r.created_at,
-    blobs: stmtMbByMsg.all(r.id).map((b: any) => b.blob_hash),
+    blobs: stmtMbByMsg.all(r.id).map((b: any) => ({ hash: b.hash, name: b.name || '', mime: b.mime, size: b.size })),
   }));
 }
 
@@ -378,8 +382,8 @@ function getBlobMeta(hash: string): { hash: string; mime: string; size: number }
   const r = stmtBlobGet.get(hash);
   return r ? { hash: r.hash, mime: r.mime, size: r.size } : null;
 }
-function linkBlob(messageId: string, hash: string, ord: number): void {
-  stmtMbIns.run(messageId, hash, ord);
+function linkBlob(messageId: string, hash: string, ord: number, name = ''): void {
+  stmtMbIns.run(messageId, hash, ord, name);
 }
 // blob 鉴权：当前 uid 是否拥有引用该 hash 的消息
 function userOwnsBlob(uid: number, hash: string): boolean {

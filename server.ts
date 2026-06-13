@@ -46,6 +46,25 @@ fs.mkdirSync(BLOB_DIR, { recursive: true });
 function blobPath(hash: string): string { return path.join(BLOB_DIR, hash); }
 function sha256(buf: Buffer): string { return crypto.createHash('sha256').update(buf).digest('hex'); }
 
+// Phase 2：纯文本类文件附件——按 UTF-8 读进上下文。单文件注入上限，超出截断。
+const FILE_TEXT_MAX = 100_000;
+// 文本类扩展名白名单（仅这些 + text/* mime 放行，二进制一律拒/忽略）。
+const TEXT_EXT = new Set([
+  'txt', 'md', 'markdown', 'csv', 'tsv', 'log', 'json', 'jsonl', 'ndjson',
+  'yaml', 'yml', 'xml', 'toml', 'ini', 'conf', 'env', 'sql', 'sh', 'bash', 'zsh',
+  'js', 'mjs', 'cjs', 'ts', 'jsx', 'tsx', 'vue', 'svelte', 'py', 'rb', 'php',
+  'java', 'kt', 'swift', 'go', 'rs', 'c', 'h', 'cpp', 'hpp', 'cc', 'cs', 'm',
+  'html', 'htm', 'css', 'scss', 'less', 'r', 'lua', 'pl', 'dart', 'gradle',
+]);
+function isTextLike(mime: string, name: string): boolean {
+  const m = (mime || '').toLowerCase();
+  if (m.startsWith('text/')) return true;
+  if (m === 'application/json' || m === 'application/xml' || m === 'application/x-ndjson') return true;
+  if (/\+(json|xml)$/.test(m)) return true;
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return TEXT_EXT.has(ext);
+}
+
 // cookie 规格：HttpOnly + SameSite=Lax + Path=/。Secure 默认按 X-Forwarded-Proto 自动判定
 // （生产经 Caddy/CF 是 https → 带 Secure；本地直连 http → 不带，否则浏览器拒存 cookie）。
 // 也可用 COOKIE_SECURE=on/off 强制。
@@ -602,13 +621,27 @@ function buildUpstreamMessages(history: any[]): any[] {
       if (m.blobs && m.blobs.length) {
         const parts: any[] = [];
         if (m.text) parts.push({ type: 'text', text: m.text });
-        for (const h of m.blobs) {
-          const meta = db.getBlobMeta(h);
+        for (const b of m.blobs) {
+          // 兼容迁移期旧数据：blob 元素可能是裸 hash 字符串（按图片处理）。
+          const hash = typeof b === 'string' ? b : b.hash;
+          const meta = db.getBlobMeta(hash);
           if (!meta) continue;
-          try {
-            const b64 = fs.readFileSync(blobPath(h)).toString('base64');
-            parts.push({ type: 'image_url', image_url: { url: `data:${meta.mime};base64,${b64}` } });
-          } catch { /* blob 文件缺失则跳过该图 */ }
+          const name = (typeof b === 'string' ? '' : b.name) || '';
+          if (meta.mime.startsWith('image/')) {
+            try {
+              const b64 = fs.readFileSync(blobPath(hash)).toString('base64');
+              parts.push({ type: 'image_url', image_url: { url: `data:${meta.mime};base64,${b64}` } });
+            } catch { /* blob 文件缺失则跳过该图 */ }
+          } else if (isTextLike(meta.mime, name)) {
+            try {
+              let content = fs.readFileSync(blobPath(hash)).toString('utf8');
+              if (content.length > FILE_TEXT_MAX) content = content.slice(0, FILE_TEXT_MAX) + '\n…（内容过长已截断）';
+              parts.push({ type: 'text', text: `\n[附件文件: ${name || hash}]\n\`\`\`\n${content}\n\`\`\`\n` });
+            } catch { /* blob 文件缺失则跳过该文件 */ }
+          } else {
+            // 非图非文本（本轮上传路径不该出现），仅标注、不读 bytes。
+            parts.push({ type: 'text', text: `\n[附件: ${name || hash}（二进制，已忽略内容）]\n` });
+          }
         }
         out.push({ role: 'user', content: parts });
       } else {
@@ -730,13 +763,18 @@ async function apiMessages(req: IncomingMessage, res: ServerResponse, session: a
   // 登录态：落 user 消息 → 后端组装上下文 → 落 assistant。
   const uid = session.uid;
   const text = String(body.text || '');
-  const attachments: string[] = Array.isArray(body.attachments) ? body.attachments.filter((h: any) => typeof h === 'string' && HASH_RE.test(h)) : [];
+  // attachments 线格式：[{hash,name}]（兼容旧版裸 hash 字符串，按无名处理）。
+  const attachments: { hash: string; name: string }[] = Array.isArray(body.attachments)
+    ? body.attachments
+        .map((a: any) => (typeof a === 'string' ? { hash: a, name: '' } : { hash: a?.hash, name: String(a?.name || '').slice(0, 200) }))
+        .filter((a: any) => typeof a.hash === 'string' && HASH_RE.test(a.hash))
+    : [];
   if (!text && !attachments.length) { sendJson(res, 400, { error: { message: '空消息' } }); return; }
   if (!db.getConvMeta(uid, convId)) db.createConv(uid, convId, text.slice(0, 24) || '新对话');
   const seq = db.nextSeq(convId, uid);
   const userMsgId = newMsgId();
   db.insertMessage({ id: userMsgId, convId, uid, seq, role: 'user', kind: 'chat', text });
-  attachments.forEach((h, i) => db.linkBlob(userMsgId, h, i));
+  attachments.forEach((a, i) => db.linkBlob(userMsgId, a.hash, i, a.name));
   if (seq === 0 && text) db.renameConv(uid, convId, text.slice(0, 24));
   db.touchConv(uid, convId);
 
