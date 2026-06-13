@@ -221,6 +221,7 @@ async function openConv(id) {
   state.currentId = id;
   renderConvList();
   renderMessages();
+  closeDrawer();          // 移动端：选中会话后收起抽屉
   const conv = currentConv();
   if (conv && !Array.isArray(conv.messages)) {
     await ensureMessages(conv);
@@ -576,6 +577,7 @@ function newConv() {
   state.currentId = conv.id;
   renderConvList();
   renderMessages();
+  closeDrawer();          // 移动端：新建对话后收起抽屉
   return conv;
 }
 
@@ -648,6 +650,20 @@ $('btn-new-chat').addEventListener('click', () => {
   if (state.streaming) return;
   newConv();
   $('input-box').focus();
+});
+
+/* ── 移动端抽屉（≤760px 侧栏滑出/收起，桌面无副作用）── */
+const openDrawer = () => $('view-app').classList.add('drawer-open');
+const closeDrawer = () => $('view-app').classList.remove('drawer-open');
+$('btn-menu').addEventListener('click', openDrawer);
+$('sidebar-scrim').addEventListener('click', closeDrawer);
+$('btn-new-mobile').addEventListener('click', () => {
+  if (state.streaming) return;
+  newConv();            // newConv 内已收起抽屉
+  $('input-box').focus();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeDrawer();
 });
 
 /* ───────────────────────── 消息渲染 ───────────────────────── */

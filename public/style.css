@@ -131,6 +131,7 @@ input:focus, textarea:focus, select:focus {
 /* ════════════════ 登录视图 ════════════════ */
 .view-login {
   position: fixed; inset: 0;
+  min-height: 100dvh;
   display: flex; align-items: center; justify-content: center;
   background:
     radial-gradient(ellipse 70% 55% at 50% 38%, rgba(45, 212, 191, 0.06), transparent 70%),
@@ -214,8 +215,12 @@ input:focus, textarea:focus, select:focus {
 .view-app {
   display: flex;
   height: 100vh;
+  height: 100dvh;          /* 移动端随软键盘收缩，避免输入框被顶到键盘下方；旧浏览器回退 100vh */
   overflow: hidden;
 }
+
+/* 移动端专属元素：桌面一律隐藏，仅 ≤760px 媒体查询里启用 */
+.hdr-menu, .hdr-newchat, .sidebar-scrim { display: none; }
 
 /* ─────────────── 侧栏 ─────────────── */
 .sidebar {
@@ -911,11 +916,60 @@ a.msg-file-chip:hover { border-color: var(--phos-dim); color: var(--phos); }
 .drop-overlay-card p { font-size: 17px; font-weight: 600; color: var(--text-0); }
 .drop-overlay-card span { font-size: 13px; color: var(--text-1); }
 
-/* ─────────────── 窄屏 ─────────────── */
+/* ─────────────── 窄屏 · 移动端（参考 GPT/Claude App：侧栏化为左侧滑出抽屉）─────────────── */
 @media (max-width: 760px) {
-  .sidebar { display: none; }
-  .messages { padding: 24px 14px 12px; }
-  .composer-zone { padding: 8px 12px 14px; }
+  /* 侧栏 → 抽屉：默认藏在屏幕左外，drawer-open 时滑入 */
+  .sidebar {
+    position: fixed; inset: 0 auto 0 0;
+    width: min(84vw, 320px);
+    z-index: 50;
+    transform: translateX(-100%);
+    transition: transform .26s cubic-bezier(.3, .8, .3, 1);
+    padding-top: env(safe-area-inset-top);
+  }
+  .view-app.drawer-open .sidebar {
+    transform: none;
+    box-shadow: 0 0 40px rgba(0, 0, 0, .5);
+  }
+
+  /* 抽屉背板：点击收起；低于设置弹层(z60)，高于正文 */
+  .sidebar-scrim {
+    display: block;
+    position: fixed; inset: 0;
+    z-index: 45;
+    background: rgba(5, 8, 10, .6);
+    opacity: 0; pointer-events: none;
+    transition: opacity .26s;
+  }
+  .view-app.drawer-open .sidebar-scrim { opacity: 1; pointer-events: auto; }
+
+  /* 顶栏：露出汉堡 + 新建图标，整体瘦身并避让状态栏 */
+  .hdr-menu, .hdr-newchat { display: inline-flex; }
+  .main-header {
+    padding: 12px 14px;
+    padding-top: calc(12px + env(safe-area-inset-top));
+    gap: 10px;
+  }
+  .model-pick-label { display: none; }
   .model-pick select { max-width: 150px; }
   .key-chip { max-width: 110px; }
+
+  /* 防 iOS 聚焦自动放大页面（输入控件字号须 ≥16px）*/
+  #input-box, input, select, textarea { font-size: 16px; }
+
+  /* 触摸目标放大；无 hover 环境下删除按钮常显 */
+  .btn-icon { width: 42px; height: 42px; }
+  .conv-item { padding: 12px 12px; }
+  .conv-item-del { opacity: 1; }
+  .img-download { opacity: 1; }
+  .btn-send { padding: 11px 18px; }
+
+  /* 正文与输入区：避让底部安全区 */
+  .messages { padding: 20px 14px 12px; }
+  .composer-zone { padding: 8px 12px calc(14px + env(safe-area-inset-bottom)); }
+  .imagegen-controls { flex-wrap: wrap; }
+
+  /* 视觉微调：用户气泡更宽、空态上移 */
+  .msg-user .msg-body { max-width: 88%; }
+  .empty-state { padding-top: 8vh; }
 }

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Manifold · 对话与生图</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='13' fill='none' stroke='%232dd4bf' stroke-width='2'/%3E%3Cellipse cx='16' cy='16' rx='13' ry='5' fill='none' stroke='%232dd4bf' stroke-width='1.2'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/style.css">
@@ -97,6 +97,9 @@
 
   <main class="main">
     <header class="main-header">
+      <button class="btn-icon hdr-menu" id="btn-menu" aria-label="打开会话菜单">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/><line x1="4" y1="17" x2="20" y2="17"/></svg>
+      </button>
       <div class="header-title" id="header-title">新对话</div>
       <div class="header-controls">
         <label class="model-pick">
@@ -104,6 +107,9 @@
           <select id="model-select"></select>
         </label>
         <button class="key-chip mono" id="key-chip" title="点击更换 Key">未设置 Key</button>
+        <button class="btn-icon hdr-newchat" id="btn-new-mobile" aria-label="新对话">
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
       </div>
     </header>
 
@@ -158,6 +164,9 @@
       </div>
     </div>
   </main>
+
+  <!-- 移动端抽屉背板遮罩（点击收起侧栏，桌面隐藏） -->
+  <div class="sidebar-scrim" id="sidebar-scrim"></div>
 
   <!-- 设置弹层 -->
   <div class="modal-mask hidden" id="settings-mask">
