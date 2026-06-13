@@ -675,7 +675,19 @@ function apiConvGet(res: ServerResponse, session: any, convId: string): void {
   if (session.uid === null) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
   const meta = db.getConvMeta(session.uid, convId);
   if (!meta) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
-  sendJson(res, 200, { ...meta, messages: db.getMessages(convId, session.uid) });
+  // 在途生成标记：前端据此决定是否开 /stream 重连，接上还没跑完的回复。
+  const task = inflight.get(taskKey(session.uid, convId));
+  const inflightInfo = task && !task.done ? { kind: task.kind } : null;
+  sendJson(res, 200, { ...meta, messages: db.getMessages(convId, session.uid), inflight: inflightInfo });
+}
+
+// 重连在途生成流：有未完成任务 → 回放已生成部分 + 续播 live 到结束；否则 204（前端回退用 DB 最终结果）。
+function apiConvStream(res: ServerResponse, session: any, convId: string): void {
+  if (session.uid === null) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  if (!db.getConvMeta(session.uid, convId)) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  const task = inflight.get(taskKey(session.uid, convId));
+  if (!task || task.done) { res.writeHead(204); res.end(); return; }
+  taskAttach(task, res);
 }
 async function apiConvPatch(req: IncomingMessage, res: ServerResponse, session: any, convId: string): Promise<void> {
   if (session.uid === null || !db.getConvMeta(session.uid, convId)) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
@@ -687,6 +699,70 @@ async function apiConvPatch(req: IncomingMessage, res: ServerResponse, session: 
 function apiConvDelete(res: ServerResponse, session: any, convId: string): void {
   if (session.uid !== null) db.deleteConv(session.uid, convId);
   sendJson(res, 200, { ok: true });
+}
+
+// ── 在途生成任务注册表（登录态）─────────────────────────────────────────
+// 把「生成」做成脱离单条连接的后台任务：任务自己拉上游、累积、落库；客户端只是订阅者。
+// 刷新/断开只是少一个订阅者，生成照常跑完 → 解决「进行中刷新就丢」。每会话至多一条在途。
+type GenTask = {
+  key: string; convId: string; uid: number; kind: 'chat' | 'image';
+  raw: Buffer[]; rawBytes: number;          // 累计「发给客户端的原始 SSE 字节」，供重连回放
+  subs: Set<ServerResponse>;                // 当前在看的连接（可 0 个：纯后台跑）
+  done: boolean; error: string | null; startedAt: number;
+};
+const inflight = new Map<string, GenTask>();
+const TASK_RAW_MAX = 8 * 1024 * 1024;       // raw 回放缓冲上限（生图 partial 较大，超限丢早段留末段）
+const TASK_GRACE_MS = 60 * 1000;            // 完成后保留时长，应对收尾瞬间的重连
+
+function taskKey(uid: number, convId: string): string { return `${uid}:${convId}`; }
+
+const SSE_HEAD: Record<string, string> = {
+  'Content-Type': 'text/event-stream; charset=utf-8',
+  'Cache-Control': 'no-cache, no-transform',
+  'Connection': 'keep-alive',
+  'X-Accel-Buffering': 'no',
+};
+function sseHead(res: ServerResponse): void {
+  if (!res.headersSent) { res.writeHead(200, SSE_HEAD); res.flushHeaders(); }
+}
+function sseData(obj: any): string { return `data: ${JSON.stringify(obj)}\n\n`; }
+// 安全写：socket 已关/已结束就跳过，避免 write-after-end / EPIPE。
+function safeWrite(res: ServerResponse, chunk: Buffer | string): boolean {
+  if (res.writableEnded || res.destroyed) return false;
+  try { return res.write(chunk); } catch { return false; }
+}
+
+// 生成产出一段原始 SSE 字节：累积供回放 + 广播给所有订阅者。
+function taskWrite(task: GenTask, chunk: Buffer): void {
+  task.raw.push(chunk); task.rawBytes += chunk.length;
+  while (task.rawBytes > TASK_RAW_MAX && task.raw.length > 1) {
+    task.rawBytes -= (task.raw.shift() as Buffer).length;   // 超限丢最早的（生图早期 partial 可丢）
+  }
+  for (const r of task.subs) safeWrite(r, chunk);
+}
+// 一个连接订阅任务：发 SSE 头 → 回放已生成部分 → 续播 live；若已完成则补 [DONE] 即结束。
+function taskAttach(task: GenTask, res: ServerResponse): void {
+  sseHead(res);
+  for (const chunk of task.raw) safeWrite(res, chunk);
+  if (task.done) {
+    if (task.error) safeWrite(res, sseData({ error: { message: task.error } }));
+    safeWrite(res, 'data: [DONE]\n\n');
+    if (!res.writableEnded) res.end();
+    return;
+  }
+  task.subs.add(res);
+  res.on('close', () => task.subs.delete(res));
+}
+// 生成结束：标记完成、给在看的订阅者补 [DONE]/错误并收尾，留宽限期后从注册表 GC。
+function taskFinish(task: GenTask): void {
+  task.done = true;
+  for (const r of task.subs) {
+    if (task.error) safeWrite(r, sseData({ error: { message: task.error } }));
+    safeWrite(r, 'data: [DONE]\n\n');
+    if (!r.writableEnded) r.end();
+  }
+  task.subs.clear();
+  setTimeout(() => { if (inflight.get(task.key) === task) inflight.delete(task.key); }, TASK_GRACE_MS).unref();
 }
 
 // 转发上游 chat SSE 给前端；若传 persist 回调，则边转发边累积 assistant 文本，流结束时调 persist 落库。
@@ -745,6 +821,55 @@ async function streamChatUpstream(res: ServerResponse, apiKey: string, model: an
   res.end();
 }
 
+// 登录态聊天：把生成喂进任务（脱离单条连接）。上游不再因某个订阅者断开而中断，只受 10 分钟超时约束；
+// 流结束累积出完整 assistant 文本，先 persist 落库再 taskFinish。
+async function runChatTask(task: GenTask, apiKey: string, model: any, messages: any[], persist: (text: string) => void): Promise<void> {
+  const ctrl = new AbortController();
+  const timeout = setTimeout(() => ctrl.abort(new Error('上游超时')), 10 * 60 * 1000);
+  let upstream: Response;
+  try {
+    upstream = await fetch(BASE + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}`, 'Accept': 'text/event-stream', 'accept-encoding': 'identity' },
+      body: JSON.stringify({ model, messages, stream: true }),
+      signal: ctrl.signal,
+    });
+  } catch (e: any) {
+    clearTimeout(timeout); task.error = '上游不可达: ' + e.message; taskFinish(task); return;
+  }
+
+  let assistantText = '';
+  if (upstream.body && upstream.ok) {
+    const decoder = new TextDecoder();
+    let sbuf = '';
+    const parse = (chunkText: string) => {
+      sbuf += chunkText;
+      const lines = sbuf.split('\n'); sbuf = lines.pop() || '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t.startsWith('data:')) continue;
+        const p = t.slice(5).trim();
+        if (!p || p === '[DONE]') continue;
+        try { const d = JSON.parse(p)?.choices?.[0]?.delta?.content; if (d) assistantText += d; } catch { /* 非 JSON delta */ }
+      }
+    };
+    try {
+      for await (const chunk of Readable.fromWeb(upstream.body)) {
+        const b = Buffer.from(chunk);
+        parse(decoder.decode(b, { stream: true }));
+        taskWrite(task, b);                       // 原样转发上游 SSE 字节（供 live + 回放）
+      }
+    } catch (e: any) { console.error(`[chat-task] stream interrupted: ${e.message}`); }
+    // 完整回复落库（即便所有订阅者都已断开）；空响应不落库也不算错（前端按「（空响应）」显示）。
+    if (assistantText) { try { persist(assistantText); } catch (e: any) { console.error(`[chat-task] persist failed: ${e.message}`); } }
+  } else {
+    const errText = upstream.body ? await upstream.text().catch(() => '') : '';
+    task.error = (errText || `上游错误 ${upstream.status}`).slice(0, 2000);
+  }
+  clearTimeout(timeout);
+  taskFinish(task);
+}
+
 // 聊天：登录态落库（{text,attachments:[hash]} → 落 user/assistant、后端组装上下文）；
 // keyonly（无 uid）走代理模式（前端拼 {messages}，不落库）。系统提示统一后端注入。
 async function apiMessages(req: IncomingMessage, res: ServerResponse, session: any, convId: string): Promise<void> {
@@ -770,6 +895,10 @@ async function apiMessages(req: IncomingMessage, res: ServerResponse, session: a
         .filter((a: any) => typeof a.hash === 'string' && HASH_RE.test(a.hash))
     : [];
   if (!text && !attachments.length) { sendJson(res, 400, { error: { message: '空消息' } }); return; }
+  // 并发护栏：同一会话已有在途生成 → 拒绝（须在落 user 消息前，避免插一条没回复的）。
+  const key = taskKey(uid, convId);
+  if (inflight.has(key)) { sendJson(res, 409, { error: { message: '上一条还在生成中，请稍候' } }); return; }
+
   if (!db.getConvMeta(uid, convId)) db.createConv(uid, convId, text.slice(0, 24) || '新对话');
   const seq = db.nextSeq(convId, uid);
   const userMsgId = newMsgId();
@@ -779,7 +908,11 @@ async function apiMessages(req: IncomingMessage, res: ServerResponse, session: a
   db.touchConv(uid, convId);
 
   const messages = buildUpstreamMessages(db.getMessages(convId, uid));
-  await streamChatUpstream(res, session.api_key, model, messages, (aText) => {
+  // 建任务、当前客户端作首个订阅者（即时 SSE）、后台跑生成（脱离本连接）。
+  const task: GenTask = { key, convId, uid, kind: 'chat', raw: [], rawBytes: 0, subs: new Set(), done: false, error: null, startedAt: Date.now() };
+  inflight.set(key, task);
+  taskAttach(task, res);
+  await runChatTask(task, session.api_key, model, messages, (aText) => {
     db.insertMessage({ id: newMsgId(), convId, uid, seq: db.nextSeq(convId, uid), role: 'assistant', kind: 'chat', model, text: aText });
     db.touchConv(uid, convId);
   });
@@ -827,8 +960,46 @@ function dataUrlToBuf(dataUrl: string): { buf: Buffer; mime: string } {
   return { buf: Buffer.from(dataUrl.slice(i + 1), 'base64'), mime };
 }
 
-// 生图：登录态落 user 消息 + 结果存 blob 落 kind=image；keyonly（无 uid）走代理模式（dataURL 参考图、不落库）。
-// 调上游 generations / edits multipart，流式绕 CF 100s，不认 stream 回退非流式；边转发边解析最终图。
+// 拉上游生图：流式逐块转发 / 非流式整包（包成单个 SSE data 事件，前端统一按 SSE 解析）。
+// 每块经 onChunk 输出（登录态→taskWrite；keyonly 走另一条直连路径不用它），并喂 parser 解析最终图。
+// 返回上游错误时不输出任何 body，交由调用方决定如何呈现。
+async function pumpImageUpstream(
+  doRequest: (stream: boolean) => Promise<Response>,
+  parser: ReturnType<typeof makeImageParser>,
+  onChunk: (b: Buffer) => void,
+): Promise<{ ok: true } | { ok: false; status: number; text: string }> {
+  let upstream = await doRequest(true);
+  if (!upstream.ok) {
+    const errText = await upstream.text();
+    if ((upstream.status === 400 || upstream.status === 422) && /stream|partial/i.test(errText)) {
+      upstream = await doRequest(false);
+      if (!upstream.ok) return { ok: false, status: upstream.status, text: await upstream.text() };
+    } else {
+      return { ok: false, status: upstream.status, text: errText };
+    }
+  }
+  const ctype = upstream.headers.get('content-type') || '';
+  if (upstream.body) {
+    if (ctype.includes('event-stream')) {
+      const decoder = new TextDecoder();
+      try {
+        for await (const chunk of Readable.fromWeb(upstream.body)) {
+          const b = Buffer.from(chunk);
+          parser.feedSse(decoder.decode(b, { stream: true }));
+          onChunk(b);
+        }
+      } catch (e: any) { console.error(`[image-task] stream interrupted: ${e.message}`); }
+    } else {
+      const buf = Buffer.from(await upstream.arrayBuffer());
+      parser.feedJson(buf.toString('utf8'));
+      onChunk(Buffer.from(`data: ${buf.toString('utf8')}\n\n`));   // 非流式整包 → 包成 SSE 事件
+    }
+  }
+  return { ok: true };
+}
+
+// 生图：登录态落 user 消息 + 结果存 blob 落 kind=image，并走后台任务（脱离连接、可刷新重连）；
+// keyonly（无 uid）保持原直连代理（dataURL 参考图、不落库）。上游 generations/edits，流式绕 CF 100s。
 async function apiImages(req: IncomingMessage, res: ServerResponse, session: any, convId: string): Promise<void> {
   if (!session.api_key) { sendJson(res, 400, { error: { message: '尚未设置 key，请先在设置里选/贴一个 key' } }); return; }
   let body: any;
@@ -836,6 +1007,13 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
   const { model, prompt, size, quality } = body;
   if (!prompt) { sendJson(res, 400, { error: { message: '缺少 prompt' } }); return; }
   const keyonly = session.uid === null;
+
+  // 登录态：并发护栏须在落 user 消息前。
+  let key = '';
+  if (!keyonly) {
+    key = taskKey(session.uid, convId);
+    if (inflight.has(key)) { sendJson(res, 409, { error: { message: '上一条还在生成中，请稍候' } }); return; }
+  }
 
   // 参考图统一成 [{buf,mime}]：keyonly 来自 dataURL；登录态来自 blob hash（并落 user 消息）。
   let refBlobs: { buf: Buffer; mime: string }[] = [];
@@ -861,7 +1039,6 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
 
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(new Error('上游超时')), 10 * 60 * 1000);
-  res.on('close', () => { if (!res.writableEnded) ctrl.abort(new Error('客户端断开')); });
 
   const doRequest = (stream: boolean): Promise<Response> => {
     if (refBlobs.length) {
@@ -882,17 +1059,9 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
     return fetch(BASE + '/v1/images/generations', { method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${session.api_key}` }, body: JSON.stringify(payload), signal: ctrl.signal });
   };
 
-  const forwardError = (status: number, ctype: string | null, text: string) => {
-    clearTimeout(timeout);
-    if (res.headersSent) { res.end(); return; }
-    res.writeHead(status, { 'Content-Type': ctype || 'application/json; charset=utf-8' });
-    res.end(text);
-  };
-
   const parser = makeImageParser();
-  // 流结束：登录态把最终图存 blob + 落 kind=image 消息；keyonly 不落（前端本地显示）。
+  // 把最终图存 blob + 落 kind=image 消息（仅登录态调用）。
   const persistImage = () => {
-    if (keyonly) return;
     const uid = session.uid;
     const { b64, url, revised, mime } = parser.result();
     let imgBuf: Buffer | null = null, imgMime = mime;
@@ -911,45 +1080,70 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
     }
   };
 
-  try {
-    let upstream = await doRequest(true);
-    if (!upstream.ok) {
-      const errText = await upstream.text();
-      if ((upstream.status === 400 || upstream.status === 422) && /stream|partial/i.test(errText)) {
-        upstream = await doRequest(false);
-        if (!upstream.ok) { forwardError(upstream.status, upstream.headers.get('content-type'), await upstream.text()); return; }
-      } else { forwardError(upstream.status, upstream.headers.get('content-type'), errText); return; }
-    }
-    const resHeaders: Record<string, string> = {};
-    upstream.headers.forEach((v: string, k: string) => { if (!SKIP_RES_HEADERS.has(k.toLowerCase())) resHeaders[k] = v; });
-    res.writeHead(upstream.status, resHeaders);
-    const ctype = upstream.headers.get('content-type') || '';
-    if (upstream.body) {
-      res.flushHeaders();
-      if (ctype.includes('event-stream')) {
-        const decoder = new TextDecoder();
-        try {
-          for await (const chunk of Readable.fromWeb(upstream.body)) {
-            if (res.destroyed) break;
-            parser.feedSse(decoder.decode(chunk, { stream: true }));
-            if (!res.write(chunk)) { if (!await drainOnce(res)) break; }
-          }
-        } catch (e: any) { console.error(`[images] stream interrupted: ${e.message}`); }
-      } else {
-        const buf = Buffer.from(await upstream.arrayBuffer());
-        res.write(buf);
-        parser.feedJson(buf.toString('utf8'));
+  // ── keyonly：原直连路径（断开即掐、不落库）──
+  if (keyonly) {
+    res.on('close', () => { if (!res.writableEnded) ctrl.abort(new Error('客户端断开')); });
+    const forwardError = (status: number, ctype: string | null, text: string) => {
+      clearTimeout(timeout);
+      if (res.headersSent) { res.end(); return; }
+      res.writeHead(status, { 'Content-Type': ctype || 'application/json; charset=utf-8' });
+      res.end(text);
+    };
+    try {
+      let upstream = await doRequest(true);
+      if (!upstream.ok) {
+        const errText = await upstream.text();
+        if ((upstream.status === 400 || upstream.status === 422) && /stream|partial/i.test(errText)) {
+          upstream = await doRequest(false);
+          if (!upstream.ok) { forwardError(upstream.status, upstream.headers.get('content-type'), await upstream.text()); return; }
+        } else { forwardError(upstream.status, upstream.headers.get('content-type'), errText); return; }
+      }
+      const resHeaders: Record<string, string> = {};
+      upstream.headers.forEach((v: string, k: string) => { if (!SKIP_RES_HEADERS.has(k.toLowerCase())) resHeaders[k] = v; });
+      res.writeHead(upstream.status, resHeaders);
+      const ctype = upstream.headers.get('content-type') || '';
+      if (upstream.body) {
+        res.flushHeaders();
+        if (ctype.includes('event-stream')) {
+          const decoder = new TextDecoder();
+          try {
+            for await (const chunk of Readable.fromWeb(upstream.body)) {
+              if (res.destroyed) break;
+              parser.feedSse(decoder.decode(chunk, { stream: true }));
+              if (!res.write(chunk)) { if (!await drainOnce(res)) break; }
+            }
+          } catch (e: any) { console.error(`[images] stream interrupted: ${e.message}`); }
+        } else {
+          const buf = Buffer.from(await upstream.arrayBuffer());
+          res.write(buf);
+          parser.feedJson(buf.toString('utf8'));
+        }
+      }
+      clearTimeout(timeout);
+      res.end();
+    } catch (e: any) {
+      clearTimeout(timeout);
+      if (!res.writableEnded) {
+        if (!res.headersSent) sendJson(res, 502, { error: { message: '生图失败: ' + e.message } });
+        else res.end();
       }
     }
-    persistImage();
-    clearTimeout(timeout);
-    res.end();
+    return;
+  }
+
+  // ── 登录态：后台任务（当前客户端作首订阅者；断开不掐，生成跑完落库）──
+  const task: GenTask = { key, convId, uid: session.uid, kind: 'image', raw: [], rawBytes: 0, subs: new Set(), done: false, error: null, startedAt: Date.now() };
+  inflight.set(key, task);
+  taskAttach(task, res);
+  try {
+    const r = await pumpImageUpstream(doRequest, parser, (b) => taskWrite(task, b));
+    if (r.ok) persistImage();
+    else task.error = (r.text || `上游错误 ${r.status}`).slice(0, 2000);
   } catch (e: any) {
+    task.error = '生图失败: ' + e.message;
+  } finally {
     clearTimeout(timeout);
-    if (!res.writableEnded) {
-      if (!res.headersSent) sendJson(res, 502, { error: { message: '生图失败: ' + e.message } });
-      else res.end();
-    }
+    taskFinish(task);
   }
 }
 
@@ -1036,6 +1230,13 @@ async function handleApi(req: IncomingMessage, res: ServerResponse): Promise<voi
     const cid = decodeURIComponent(mImg[1]);
     if (!CONV_ID_RE.test(cid)) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
     return apiImages(req, res, session, cid);
+  }
+  // 重连在途生成流（刷新后接上还没跑完的回复）
+  const mStream = /^\/api\/conversations\/([^/]+)\/stream$/.exec(url);
+  if (mStream && method === 'GET') {
+    const cid = decodeURIComponent(mStream[1]);
+    if (!CONV_ID_RE.test(cid)) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
+    return apiConvStream(res, session, cid);
   }
   // 单条会话：GET / PATCH / DELETE
   const mConv = /^\/api\/conversations\/([^/]+)$/.exec(url);

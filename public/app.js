@@ -209,6 +209,7 @@ async function ensureMessages(conv) {
   try {
     const full = await store.get(conv.id);
     conv.messages = (full && full.messages) || [];
+    conv._inflight = full?.inflight || null;   // 在途生成标记：openConv 据此重连 /stream
   } catch (e) {
     conv.messages = [];
     console.warn('加载会话正文失败', e);
@@ -227,6 +228,62 @@ async function openConv(id) {
     await ensureMessages(conv);
     if (state.currentId === id) renderMessages();
   }
+  // 该会话有在途生成（如刷新前正在跑的回复）→ 接上后台流继续看
+  if (conv && conv._inflight && state.currentId === id && !state.streaming) {
+    reconnectInflight(conv);   // 不 await：已加载的消息先渲染，再续接在途流
+  }
+}
+
+// 重连在途生成：刷新/重开会话后接上后台还没跑完的回复（聊天逐字 / 生图逐帧）。
+// 后端已把生成做成脱离连接的任务，这里只是重新订阅；结束后从 DB 重拉同步规范状态。
+async function reconnectInflight(conv) {
+  const kind = conv._inflight?.kind;
+  conv._inflight = null;                 // 只触发一次
+  if (!kind || state.streaming) return;
+
+  const ctrl = new AbortController();
+  state.streaming = ctrl;                 // 复用流式态：停止按钮可中止订阅（生成仍在后台跑完落库）
+  setSending(true);
+
+  const finish = async () => {
+    setSending(false);                    // 内部已置 state.streaming = null
+    conv.messages = null;
+    await ensureMessages(conv);           // 后端已落库 → 重拉同步
+    if (state.currentId === conv.id) renderMessages();
+  };
+
+  let res;
+  try {
+    res = await fetch(`/api/conversations/${encodeURIComponent(conv.id)}/stream`, { signal: ctrl.signal });
+  } catch { await finish(); return; }
+  if (res.status === 204 || !res.ok || !res.body) { await finish(); return; }  // 已无在途任务 → 直接同步
+
+  if (kind === 'image') {
+    const pendingEl = document.createElement('div');
+    pendingEl.className = 'msg msg-assistant is-image';
+    pendingEl.innerHTML = `
+      <div class="msg-role"><span class="msg-role-glyph">✦</span><span class="msg-role-name">续接生成中…</span></div>
+      <div class="msg-body"><div class="gen-pending"><div class="gen-rings"><span></span><span></span><span></span></div><div class="gen-pending-text">接上后台生成…</div></div></div>`;
+    $('messages').appendChild(pendingEl);
+    scrollToBottom(true);
+    try { await readImageSse(res, pendingEl); } catch { /* 出错由下方 DB 同步纠正 */ }
+  } else {
+    const aMsg = { role: 'assistant', text: '', kind: 'chat' };
+    const aEl = buildMsgEl(aMsg);
+    const aBody = aEl.querySelector('.msg-body');
+    aBody.innerHTML = '<span class="stream-caret"></span>';
+    $('messages').appendChild(aEl);
+    scrollToBottom(true);
+    let last = 0;
+    try {
+      await pumpChatSse(res, (d) => {
+        aMsg.text += d;
+        const now = Date.now();
+        if (now - last > 90) { last = now; aBody.innerHTML = mdRender(aMsg.text) + '<span class="stream-caret"></span>'; scrollToBottom(false); }
+      });
+    } catch { /* 出错/中止由下方 DB 同步纠正 */ }
+  }
+  await finish();   // renderMessages 会清空临时气泡、按 DB 规范状态重渲染
 }
 
 // 统一加载会话列表（按 useServer 选后端/本地），并设好 currentId
@@ -1135,6 +1192,34 @@ function buildApiMessages(conv) {
   return out;
 }
 
+// 读一条聊天 SSE 流：对每个内容增量调 onDelta；遇 error 事件抛出。发送与重连共用。
+async function pumpChatSse(res, onDelta) {
+  const handleLine = (line) => {
+    const t = line.trim();
+    if (!t.startsWith('data:')) return;
+    const payload = t.slice(5).trim();
+    if (payload === '[DONE]') return;
+    let j;
+    try { j = JSON.parse(payload); } catch { return; }
+    if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
+    const delta = j.choices?.[0]?.delta;
+    if (delta?.content) onDelta(delta.content);
+  };
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) handleLine(line);
+  }
+  buf += decoder.decode();
+  for (const line of buf.split('\n')) if (line.trim()) handleLine(line);
+}
+
 async function sendChat(text) {
   const conv = currentConv() || newConv();
   await ensureMessages(conv);
@@ -1184,39 +1269,13 @@ async function sendChat(text) {
       });
     }
 
+    if (res.status === 409) throw new Error('上一条还在生成中，请稍候');
     if (!res.ok) {
       const errText = await res.text();
       throw new Error(formatApiError(res.status, errText));
     }
 
-    const handleSseLine = (line) => {
-      const t = line.trim();
-      if (!t.startsWith('data:')) return;
-      const payload = t.slice(5).trim();
-      if (payload === '[DONE]') return;
-      let j;
-      try { j = JSON.parse(payload); } catch { return; }
-      if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
-      const delta = j.choices?.[0]?.delta;
-      if (delta?.content) {
-        aMsg.text += delta.content;
-        renderStream(false);
-      }
-    };
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-      const lines = buf.split('\n');
-      buf = lines.pop();
-      for (const line of lines) handleSseLine(line);
-    }
-    buf += decoder.decode();
-    for (const line of buf.split('\n')) if (line.trim()) handleSseLine(line);
+    await pumpChatSse(res, (d) => { aMsg.text += d; renderStream(false); });
     if (!aMsg.text) aMsg.text = '（空响应）';
     renderStream(true);
   } catch (err) {
@@ -1362,6 +1421,7 @@ async function sendImageGen(prompt) {
       signal: ctrl.signal,
     });
 
+    if (res.status === 409) throw new Error('上一条还在生成中，请稍候');
     if (!res.ok) {
       throw new Error(formatApiError(res.status, await res.text()));
     }
