@@ -1200,3 +1200,26 @@ server.listen(PORT, () => {
   console.log(`Manifold chat-demo 已启动: http://localhost:${PORT}`);
   console.log(`上游 sub2api: ${BASE}`);
 });
+
+// ── Blob GC：周期清理孤儿 blob ────────────────────────────────────
+// 删会话会连带删 messages/message_blobs，其引用的图/文件 blob 随之变孤儿（§3）。
+// 带宽限期：只清 created_at 早于 now-GRACE 的，避免误删「刚上传拿到 hash、还没发消息挂载」的 blob。
+const BLOB_GC_GRACE_MS = Number(process.env.BLOB_GC_GRACE_MS || 60 * 60 * 1000);        // 1h 宽限
+const BLOB_GC_INTERVAL_MS = Number(process.env.BLOB_GC_INTERVAL_MS || 6 * 60 * 60 * 1000); // 每 6h 扫一次
+function gcBlobs(): void {
+  try {
+    const hashes = db.orphanBlobs(Date.now() - BLOB_GC_GRACE_MS);
+    let removed = 0;
+    for (const h of hashes) {
+      if (!HASH_RE.test(h)) continue;        // 防御：非法 hash 绝不碰文件系统
+      try { fs.rmSync(blobPath(h), { force: true }); } catch { /* 文件已不在也无妨 */ }
+      db.deleteBlob(h);
+      removed++;
+    }
+    if (removed) console.log(`[blob-gc] 清理孤儿 blob ${removed} 个`);
+  } catch (e: any) {
+    console.error('[blob-gc] 失败:', e.message);
+  }
+}
+setTimeout(gcBlobs, 5 * 60 * 1000).unref();          // 启动 5 分钟后跑一次（错开冷启动）
+setInterval(gcBlobs, BLOB_GC_INTERVAL_MS).unref();   // 之后周期跑；unref 不阻塞优雅关闭
