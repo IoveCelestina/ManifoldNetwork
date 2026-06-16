@@ -698,6 +698,15 @@ function apiConvStream(res: ServerResponse, session: any, convId: string): void 
   if (!task || task.done) { res.writeHead(204); res.end(); return; }
   taskAttach(task, res);
 }
+
+// 取消在途生成：用户点「停止」时调，真正 abort 上游请求（任务随即 taskFinish，done=true，不再挡新消息）。
+// 幂等：无在途任务也回 200。
+function apiConvCancel(res: ServerResponse, session: any, convId: string): void {
+  if (session.uid === null) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
+  const task = inflight.get(taskKey(session.uid, convId));
+  if (task && !task.done && task.cancel) task.cancel();
+  sendJson(res, 200, { ok: true });
+}
 async function apiConvPatch(req: IncomingMessage, res: ServerResponse, session: any, convId: string): Promise<void> {
   if (session.uid === null || !db.getConvMeta(session.uid, convId)) { sendJson(res, 404, { error: { message: 'not found' } }); return; }
   let body: any;
@@ -718,12 +727,28 @@ type GenTask = {
   raw: Buffer[]; rawBytes: number;          // 累计「发给客户端的原始 SSE 字节」，供重连回放
   subs: Set<ServerResponse>;                // 当前在看的连接（可 0 个：纯后台跑）
   done: boolean; error: string | null; startedAt: number;
+  cancel?: () => void;                      // 外部取消通道：abort 上游请求（用户点「停止」时调）
+  canceled?: boolean;                       // 标记「用户主动取消」，与上游错误区分，避免误报
 };
 const inflight = new Map<string, GenTask>();
 const TASK_RAW_MAX = 8 * 1024 * 1024;       // raw 回放缓冲上限（生图 partial 较大，超限丢早段留末段）
 const TASK_GRACE_MS = 60 * 1000;            // 完成后保留时长，应对收尾瞬间的重连
 
 function taskKey(uid: number, convId: string): string { return `${uid}:${convId}`; }
+
+// 同一会话是否有「仍在生成（未完成）」的任务。已完成但还在 TASK_GRACE_MS 宽限期内的不算——
+// 那段保留只为 /stream 重连重放结果，不该把新一轮生成误判成「上一条还在生成」。
+function isGenerating(key: string): boolean {
+  const t = inflight.get(key);
+  return !!t && !t.done;
+}
+
+// 给任务绑定取消通道：abort 上游并标记「用户主动取消」（与上游错误区分，避免误报）。
+// 独立函数定义是有意为之——闭包只捕获 task/ctrl，不会连带各 runner 作用域里的大对象
+// （如 apiImages 的 refBlobs 参考图 Buffer、parser、doRequest）被 inflight 保活整个宽限期。
+function bindCancel(task: GenTask, ctrl: AbortController): void {
+  task.cancel = () => { task.canceled = true; ctrl.abort(new Error('用户取消')); };
+}
 
 const SSE_HEAD: Record<string, string> = {
   'Content-Type': 'text/event-stream; charset=utf-8',
@@ -771,6 +796,7 @@ function taskFinish(task: GenTask): void {
     if (!r.writableEnded) r.end();
   }
   task.subs.clear();
+  task.cancel = undefined;   // 已完成，取消通道作废 → 释放对 ctrl 的捕获，不必留到宽限期结束
   setTimeout(() => { if (inflight.get(task.key) === task) inflight.delete(task.key); }, TASK_GRACE_MS).unref();
 }
 
@@ -834,6 +860,7 @@ async function streamChatUpstream(res: ServerResponse, apiKey: string, model: an
 // 流结束累积出完整 assistant 文本，先 persist 落库再 taskFinish。
 async function runChatTask(task: GenTask, apiKey: string, model: any, messages: any[], persist: (text: string) => void): Promise<void> {
   const ctrl = new AbortController();
+  bindCancel(task, ctrl);
   const timeout = setTimeout(() => ctrl.abort(new Error('上游超时')), 10 * 60 * 1000);
   let upstream: Response;
   try {
@@ -844,7 +871,9 @@ async function runChatTask(task: GenTask, apiKey: string, model: any, messages: 
       signal: ctrl.signal,
     });
   } catch (e: any) {
-    clearTimeout(timeout); task.error = '上游不可达: ' + e.message; taskFinish(task); return;
+    clearTimeout(timeout);
+    if (!task.canceled) task.error = '上游不可达: ' + e.message;   // 用户取消不算错误
+    taskFinish(task); return;
   }
 
   let assistantText = '';
@@ -906,7 +935,7 @@ async function apiMessages(req: IncomingMessage, res: ServerResponse, session: a
   if (!text && !attachments.length) { sendJson(res, 400, { error: { message: '空消息' } }); return; }
   // 并发护栏：同一会话已有在途生成 → 拒绝（须在落 user 消息前，避免插一条没回复的）。
   const key = taskKey(uid, convId);
-  if (inflight.has(key)) { sendJson(res, 409, { error: { message: '上一条还在生成中，请稍候' } }); return; }
+  if (isGenerating(key)) { sendJson(res, 409, { error: { message: '上一条还在生成中，请稍候' } }); return; }
 
   if (!db.getConvMeta(uid, convId)) db.createConv(uid, convId, text.slice(0, 24) || '新对话');
   const seq = db.nextSeq(convId, uid);
@@ -1021,7 +1050,7 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
   let key = '';
   if (!keyonly) {
     key = taskKey(session.uid, convId);
-    if (inflight.has(key)) { sendJson(res, 409, { error: { message: '上一条还在生成中，请稍候' } }); return; }
+    if (isGenerating(key)) { sendJson(res, 409, { error: { message: '上一条还在生成中，请稍候' } }); return; }
   }
 
   // 参考图统一成 [{buf,mime}]：keyonly 来自 dataURL；登录态来自 blob hash（并落 user 消息）。
@@ -1143,13 +1172,15 @@ async function apiImages(req: IncomingMessage, res: ServerResponse, session: any
   // ── 登录态：后台任务（当前客户端作首订阅者；断开不掐，生成跑完落库）──
   const task: GenTask = { key, convId, uid: session.uid, kind: 'image', raw: [], rawBytes: 0, subs: new Set(), done: false, error: null, startedAt: Date.now() };
   inflight.set(key, task);
+  bindCancel(task, ctrl);
   taskAttach(task, res);
   try {
     const r = await pumpImageUpstream(doRequest, parser, (b) => taskWrite(task, b));
-    if (r.ok) persistImage();
+    if (task.canceled) { /* 用户取消：不落半成品图、不报错 */ }
+    else if (r.ok) persistImage();
     else task.error = (r.text || `上游错误 ${r.status}`).slice(0, 2000);
   } catch (e: any) {
-    task.error = '生图失败: ' + e.message;
+    if (!task.canceled) task.error = '生图失败: ' + e.message;
   } finally {
     clearTimeout(timeout);
     taskFinish(task);
@@ -1242,10 +1273,10 @@ async function handleApi(req: IncomingMessage, res: ServerResponse): Promise<voi
   }
   // 重连在途生成流（刷新后接上还没跑完的回复）
   const mStream = /^\/api\/conversations\/([^/]+)\/stream$/.exec(url);
-  if (mStream && method === 'GET') {
+  if (mStream && (method === 'GET' || method === 'DELETE')) {
     const cid = decodeURIComponent(mStream[1]);
     if (!CONV_ID_RE.test(cid)) { sendJson(res, 400, { error: { message: '非法会话 id' } }); return; }
-    return apiConvStream(res, session, cid);
+    return method === 'DELETE' ? apiConvCancel(res, session, cid) : apiConvStream(res, session, cid);
   }
   // 单条会话：GET / PATCH / DELETE
   const mConv = /^\/api\/conversations\/([^/]+)$/.exec(url);

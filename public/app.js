@@ -1139,7 +1139,13 @@ $('btn-send').addEventListener('click', onSend);
 
 function onSend() {
   if (state.streaming) {
-    state.streaming.abort();
+    state.streaming.abort();          // 断开本地观看
+    // 登录态：生成是脱离连接的后台任务，仅 abort 本地连接掐不掉它 → 显式通知后端取消，
+    // 否则任务跑完前 done 一直为 false，下一条会被 409「上一条还在生成中」拦住。
+    const conv = currentConv();
+    if (conv && useServer()) {
+      fetch(`/api/conversations/${encodeURIComponent(conv.id)}/stream`, { method: 'DELETE' }).catch(() => {});
+    }
     return;
   }
   const text = inputBox.value.trim();
