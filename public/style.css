@@ -381,8 +381,8 @@ input:focus, textarea:focus, select:focus {
   to   { opacity: 1; transform: none; }
 }
 
-/* 用户消息：右侧墨片 */
-.msg-user { display: flex; justify-content: flex-end; }
+/* 用户消息：右侧墨片（列向堆叠，让时间小字落在气泡下方并右对齐） */
+.msg-user { display: flex; flex-direction: column; align-items: flex-end; }
 .msg-user .msg-body {
   max-width: 82%;
   background: var(--ink-3);
@@ -416,6 +416,17 @@ input:focus, textarea:focus, select:focus {
   word-break: break-word;
 }
 .msg-assistant.is-image .msg-body { border-left-color: var(--amber-faint); }
+
+/* 一行小字：发送时间 / 回复完成时间（绝对日期） */
+.msg-time {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .04em;
+  color: var(--text-2);
+  opacity: .7;
+  margin-top: 6px;
+}
+.msg-assistant .msg-time { padding-left: 16px; }   /* 与正文左缩进对齐 */
 
 /* 流式光标 */
 .stream-caret {

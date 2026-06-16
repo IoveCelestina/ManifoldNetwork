@@ -37,6 +37,25 @@ function fmtBytes(n) {
   if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
   return (n / 1024 / 1024).toFixed(1) + ' MB';
 }
+// 消息时间戳 → 绝对日期（本地时区），形如 2026/06/16 14:30:45。
+function fmtMsgTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  if (isNaN(d)) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+// 在消息元素末尾挂/更新「一行小字」时间。无 ts 则不显示。
+function setMsgTime(msgEl, ts) {
+  if (!msgEl || !ts) return;
+  let el = msgEl.querySelector(':scope > .msg-time');
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'msg-time';
+    msgEl.appendChild(el);
+  }
+  el.textContent = fmtMsgTime(ts);
+}
 
 /* ───────────────────────── 状态 ───────────────────────── */
 
@@ -890,6 +909,8 @@ function buildMsgEl(m) {
     if (aImgs.length) body.appendChild(buildImages(aImgs, true));
     div.appendChild(body);
   }
+  // 一行小字：用户消息=发送时间，助手消息=回复完成时间（流式中还没 createdAt，完成后再补）。
+  setMsgTime(div, m.createdAt);
   return div;
 }
 
@@ -1147,7 +1168,7 @@ function setSending(on) {
 function pushUserMessage(conv, text) {
   // atts 归一化保存：图片留 dataUrl、文本文件留 text，供乐观渲染与 keyonly 本地持久化。
   const atts = state.attachments.map((a) => ({ ...a }));
-  const msg = { role: 'user', text, atts, kind: 'chat' };
+  const msg = { role: 'user', text, atts, kind: 'chat', createdAt: Date.now() };
   conv.messages.push(msg);
   if (conv.title === '新对话' && text) conv.title = text.slice(0, 24);
   state.attachments = [];
@@ -1282,16 +1303,20 @@ async function sendChat(text) {
 
     await pumpChatSse(res, (d) => { aMsg.text += d; renderStream(false); });
     if (!aMsg.text) aMsg.text = '（空响应）';
+    aMsg.createdAt = Date.now();          // 回复完成时间
     renderStream(true);
+    setMsgTime(aEl, aMsg.createdAt);
   } catch (err) {
     conv.messages.pop();
     aEl.remove();
     if (err.name !== 'AbortError') {
       pushErrorMessage(conv, err.message);
     } else if (aMsg.text) {
+      aMsg.createdAt = Date.now();        // 手动停止：以停止时刻为完成时间
       conv.messages.push(aMsg);
       aMsg.text += '\n\n*（已手动停止）*';
       aEl.querySelector('.msg-body').innerHTML = mdRender(aMsg.text);
+      setMsgTime(aEl, aMsg.createdAt);
       $('messages').appendChild(aEl);
     }
   } finally {
@@ -1464,6 +1489,7 @@ async function sendImageGen(prompt) {
       text: revised ? `*${revised}*` : '',
       images,
       meta: `${size} · ${secs}s`,
+      createdAt: Date.now(),              // 生图完成时间
     };
     conv.messages.push(msg);
     pendingEl.remove();
