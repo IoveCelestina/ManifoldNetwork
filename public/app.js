@@ -1226,11 +1226,12 @@ function buildApiMessages(conv) {
 
 // 读一条聊天 SSE 流：对每个内容增量调 onDelta；遇 error 事件抛出。发送与重连共用。
 async function pumpChatSse(res, onDelta) {
+  let sawDone = false;
   const handleLine = (line) => {
     const t = line.trim();
     if (!t.startsWith('data:')) return;
     const payload = t.slice(5).trim();
-    if (payload === '[DONE]') return;
+    if (payload === '[DONE]') { sawDone = true; return; }
     let j;
     try { j = JSON.parse(payload); } catch { return; }
     if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
@@ -1247,6 +1248,9 @@ async function pumpChatSse(res, onDelta) {
     const lines = buf.split('\n');
     buf = lines.pop();
     for (const line of lines) handleLine(line);
+    // 收到 [DONE] 立刻收尾：有些上游/代理发完 [DONE] 后迟迟不关连接，
+    // 傻等 reader done 会一直卡住（按钮停在「停止」，下次发送被当成中止）
+    if (sawDone) { reader.cancel().catch(() => {}); break; }
   }
   buf += decoder.decode();
   for (const line of buf.split('\n')) if (line.trim()) handleLine(line);
